@@ -1,0 +1,74 @@
+[project]
+name = "orch"
+version = "0.1.0"
+description = "Deterministic orchestrator for the agent developer workflow"
+readme = "README.md"
+authors = [
+    { name = "Andrew Herrington", email = "aherrington@nvidia.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "click>=8.1",
+    "rich>=14.0",
+    "aiosqlite>=0.21",
+    "sqlalchemy[asyncio]>=2.0.49",
+    "alembic>=1.18.4",
+    "pyyaml>=6.0.3",
+    "pydantic>=2.13.4",
+    "hindsight-client>=0.5",
+]
+
+[project.scripts]
+orch = "orch.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.5,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=1.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.11",
+    "pre-commit>=4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py314"
+line-length = 99
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "UP",    # pyupgrade
+    "SIM",   # flake8-simplify
+    "RUF",   # ruff-specific rules
+    "ANN",   # flake8-annothations
+    "ASYNC", # flake8-async
+    "SIM",   # flake8-simplify
+    "PTH",   # flake8-use-pathlib
+    "RUF",   # ruff specific rules
+    "TRY"    # tryceratops
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ASYNC"]  # sync path/file ops in test assertions are fine
+
+[tool.ruff.lint.isort]
+known-first-party = ["orch"]
+
+[tool.coverage.run]
+source = ["src/orch"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true

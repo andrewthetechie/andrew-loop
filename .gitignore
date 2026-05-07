@@ -1,0 +1,8 @@
+context/
+.coverage
+.python-version
+__pycache__/
+*.pyc
+.venv/
+.orchestra/
+.gitnexus
