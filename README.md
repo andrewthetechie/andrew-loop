@@ -2,6 +2,8 @@
 
 A deterministic orchestration system for solo developers. Write a PRD, decompose it into tickets, then hand off implementation to an automated pipeline that handles coding, code review, security audit, and merge.
 
+<img width="1490" height="852" alt="image" src="https://github.com/user-attachments/assets/7ca04d69-b0b8-4cd1-b029-f2206a479236" />
+
 ## How it works
 
 A developer writes a [PRD](https://en.wikipedia.org/wiki/Product_requirements_document) and runs it through the decomposer to produce a set of well-specified tickets. The `orch router` then polls for routable tickets and dispatches the correct specialist agent to each one using [opencode](https://opencode.ai) as the agent harness.
