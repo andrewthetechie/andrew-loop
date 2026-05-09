@@ -4,7 +4,7 @@ A deterministic orchestration system for solo developers. Write a PRD, decompose
 
 ## How it works
 
-A developer writes a PRD and runs it through the decomposer to produce a set of well-specified tickets. The `orch router` then polls for routable tickets and dispatches the correct specialist agent to each one using [opencode](https://opencode.ai) as the agent harness.
+A developer writes a [PRD](https://en.wikipedia.org/wiki/Product_requirements_document) and runs it through the decomposer to produce a set of well-specified tickets. The `orch router` then polls for routable tickets and dispatches the correct specialist agent to each one using [opencode](https://opencode.ai) as the agent harness.
 
 PRD → decomposer → tickets → router → coder → reviewer → merger → merged PR
 
