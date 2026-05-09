@@ -176,7 +176,13 @@ Use the following tools for navigation, context, and knowledge retention:
 - **Context7** — use `query-docs` to check library documentation when evaluating whether the implementation follows best practices.
 - **Hindsight** — retain merge outcomes, scope mismatches, and escalation decisions to the `lessons-learned` mental model after each merge attempt.
 
-Bash usage is restricted to `gh` commands only. Use `gh` for pull request operations (merge, comment, checks).
+Use the provided custom tools for all PR operations:
+
+- **`pr-status`** — get PR state, mergeability, review decision, and check results in one call. Use this instead of `gh pr view` directly.
+- **`pr-merge`** — merge the PR. Use this instead of `gh pr merge` directly.
+- **`gh pr comment`** via bash — leave comments on the PR.
+
+Do not call `gh pr view --json` directly. The field names vary by gh version and many are invalid. Use `pr-status` instead.
 
 ## Project Management Updates
 

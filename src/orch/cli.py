@@ -301,6 +301,102 @@ def show(ctx: click.Context, ticket_id: str, as_json: bool, as_yaml: bool) -> No
     _run(_show())
 
 
+@tickets.command("worktree")
+@click.argument("ticket_id")
+@click.pass_context
+def worktree_cmd(ctx: click.Context, ticket_id: str) -> None:
+    """Print the worktree directory path for a ticket."""
+
+    async def _worktree() -> None:
+        db_path = ctx.obj["db_path"]
+        async with Database(Path(db_path)) as db:
+            ticket = await get_ticket(db, ticket_id)
+            if ticket is None:
+                click.echo(f"Error: Ticket '{ticket_id}' not found.", err=True)
+                sys.exit(1)
+            if not ticket.worktree_path:
+                click.echo(f"Error: Ticket '{ticket_id}' has no worktree assigned.", err=True)
+                sys.exit(1)
+            click.echo(ticket.worktree_path)
+
+    _run(_worktree())
+
+
+@tickets.command("reset")
+@click.argument("ticket_id")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
+@click.pass_context
+def reset_cmd(ctx: click.Context, ticket_id: str, yes: bool) -> None:
+    """Reset a ticket to To Do, clearing comments, worktree, and branch.
+
+    Deletes the git worktree and branch, clears all comments, resets rework
+    count, and sets state back to To Do. Use when a ticket has false-start
+    history that would confuse the next agent run.
+    """
+    import shutil
+    import subprocess
+
+    async def _reset() -> None:
+        db_path = ctx.obj["db_path"]
+        async with Database(Path(db_path)) as db:
+            ticket = await get_ticket(db, ticket_id)
+            if ticket is None:
+                click.echo(f"Error: Ticket '{ticket_id}' not found.", err=True)
+                sys.exit(1)
+
+            if not yes:
+                click.confirm(
+                    f"Reset {ticket_id} ({ticket.state})?\n"
+                    "  This will delete the worktree, branch, and all comments.",
+                    abort=True,
+                )
+
+            repo_root = Path.cwd()
+
+            # Delete git worktree
+            if ticket.worktree_path:
+                wt = Path(ticket.worktree_path)
+                if wt.is_dir():
+                    result = subprocess.run(
+                        ["git", "worktree", "remove", "--force", str(wt)],
+                        capture_output=True, cwd=str(repo_root),
+                    )
+                    if result.returncode != 0:
+                        # Fallback: remove directory and prune
+                        shutil.rmtree(wt, ignore_errors=True)
+                        subprocess.run(["git", "worktree", "prune"], cwd=str(repo_root))
+                    console.print(f"  [dim]deleted worktree {wt}[/dim]")
+
+            # Delete git branch
+            branch = f"ticket/{ticket_id}"
+            result = subprocess.run(
+                ["git", "branch", "-D", branch],
+                capture_output=True, cwd=str(repo_root),
+            )
+            if result.returncode == 0:
+                console.print(f"  [dim]deleted branch {branch}[/dim]")
+
+            # Clear all comments
+            from sqlalchemy import delete as sa_delete
+            from orch.db import TicketComment
+            async with db.session() as session:
+                await session.execute(sa_delete(TicketComment).where(TicketComment.ticket_id == ticket_id))
+                await session.commit()
+            console.print(f"  [dim]cleared comments[/dim]")
+
+            # Reset ticket fields
+            await update_ticket(
+                db, ticket_id,
+                state="To Do",
+                linked_pr=None,
+                worktree_path=None,
+                rework_loop_count=0,
+            )
+            console.print(f"[green]✓[/green] {ticket_id} reset to To Do")
+
+    _run(_reset())
+
+
 @tickets.command()
 @click.argument("ticket_id")
 @click.argument("new_state")

@@ -203,19 +203,12 @@ class RouterTUI:
             cost_str = f"${cost:.4f}" if cost else "—"
             reason = part.get("reason", "")
 
-            # Context = input tokens (preferred) or total - output as fallback.
-            # Some providers (opencode-go/qwen, glm) don't report input separately.
-            input_tok = tokens.get("input", 0)
-            output_tok = tokens.get("output", 0)
-            cache_read = tokens.get("cache", {}).get("read", 0)
-            if input_tok:
-                self._context_used = input_tok
-            elif total_tok and total_tok > output_tok:
-                # Fallback: total - output ≈ input + reasoning + cache
-                self._context_used = total_tok - output_tok
-            elif cache_read:
-                # Last resort: cached tokens are a lower-bound on context size
-                self._context_used = cache_read
+            # Use total tokens as context proxy — robust across all providers.
+            # Local models (opencode-go/qwen, glm) often don't report input/output
+            # breakdown separately. total_tok grows with each step as context accumulates
+            # and is always a reliable non-zero signal of context window usage.
+            if total_tok:
+                self._context_used = total_tok
 
             if cost:
                 self._total_cost += cost

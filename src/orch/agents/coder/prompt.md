@@ -178,7 +178,7 @@ Before editing code:
 5. Check existing patterns before introducing new files, dependencies, components, APIs, or test structures.
 6. Check whether a library or framework is already used before writing code that depends on it.
 
-**File path rule:** Always use **relative paths** with `read`, `edit`, and `write` tools. Serena returns absolute paths (e.g. `/home/andrew/jelly-swipe/jellyswipe/foo.py`) — strip the working directory prefix and use only the relative part (e.g. `jellyswipe/foo.py`). Absolute paths outside the working directory are rejected by the sandbox.
+**File path rule:** Always use **relative paths** with `read`, `edit`, and `write` tools. If you need a temporary file, write it to the current directory (e.g. `.tmp_diff.txt`) and delete it when done — `/tmp` is outside the sandbox and will be rejected. Serena returns absolute paths (e.g. `/home/andrew/jelly-swipe/jellyswipe/foo.py`) — strip the working directory prefix and use only the relative part (e.g. `jellyswipe/foo.py`). Absolute paths outside the working directory are rejected by the sandbox.
 
 When editing:
 
