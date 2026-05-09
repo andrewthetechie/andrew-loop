@@ -66,6 +66,10 @@ class AgentsConfig(BaseModel):
     decomposer: AgentModelConfig = AgentModelConfig()
 
 
+class StateConfig(BaseModel):
+    base_dir: str = "~/.local/share/orch"
+
+
 class Config(BaseModel):
     webhook: WebhookConfig = WebhookConfig()
     harness: HarnessConfig = HarnessConfig()
@@ -74,6 +78,7 @@ class Config(BaseModel):
     hindsight: HindsightConfig = HindsightConfig()
     mcp: McpConfig = McpConfig()
     agents: AgentsConfig = AgentsConfig()
+    state: StateConfig = StateConfig()
 
     @classmethod
     def load(

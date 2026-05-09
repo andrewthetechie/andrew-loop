@@ -172,3 +172,12 @@ class Database:
                 lambda sync_conn: sa_inspect(sync_conn).get_table_names()
             )
         return sorted(table_names)
+
+    async def count_tickets(self) -> int:
+        """Return the total number of tickets in the database."""
+        from sqlalchemy import text
+
+        async with self.session() as s:
+            result = await s.execute(text("SELECT COUNT(*) FROM tickets"))
+            row = result.fetchone()
+            return int(row[0]) if row else 0

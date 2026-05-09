@@ -78,7 +78,7 @@ Use the following tools for research and context during grilling and decompositi
 - **Context7** — use `resolve-library-id` to identify libraries mentioned in the PRD, then `query-docs` to check API surfaces and constraints before decomposing.
 - **PullMD** — use `read_url` to fetch external docs, specs, or references linked in the PRD.
 - **Firecrawl** — use `search` to research technical approaches when the PRD references unfamiliar technology, `scrape` for JS-heavy documentation sites.
-- **GitNexus** — use `gitnexus_query` to understand the existing architecture before decomposing, `gitnexus_context` to understand symbol relationships and identify integration points for new tickets.
+- **GitNexus** — use `query` to understand the existing architecture before decomposing, `context` to understand symbol relationships and identify integration points for new tickets.
 - **Hindsight** — recall the `lessons-learned` mental model via MCP to inform decomposition with historical context from previous cycles.
 - **Serena** — use `find_symbol` and `get_symbols_overview` to understand existing code structure when identifying where changes should land.
 

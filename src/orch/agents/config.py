@@ -11,6 +11,10 @@ from pydantic import BaseModel
 
 AGENTS_SOURCE_DIR = Path(__file__).parent
 
+# .opencode/ lives at the repo root — 4 levels up from src/orch/agents/
+_OPENCODE_SOURCE_DIR = Path(__file__).parent.parent.parent.parent / ".opencode"
+TOOLS_SOURCE_DIR = _OPENCODE_SOURCE_DIR / "tools"
+
 
 class AgentConfig(BaseModel):
     """Base agent config that serializes to opencode JSON format."""
@@ -127,6 +131,9 @@ def reviewer_agent_config() -> AgentConfig:
             "task": "deny",
             "websearch": "deny",
             "webfetch": "deny",
+            "ticket-read": "allow",
+            "ticket-update": "allow",
+            "ticket-comment": "allow",
             "serena_*": "allow",
             "gitnexus_*": "allow",
             "context7_*": "allow",
@@ -154,6 +161,10 @@ def merger_agent_config() -> AgentConfig:
             "task": "deny",
             "websearch": "deny",
             "webfetch": "deny",
+            "ticket-read": "allow",
+            "ticket-update": "allow",
+            "ticket-comment": "allow",
+            "ticket-list": "allow",
             "serena_*": "allow",
             "gitnexus_*": "allow",
             "context7_*": "allow",
@@ -214,6 +225,47 @@ def compile_all_agents(
     return result
 
 
+def copy_tool_files(target_repo: Path) -> None:
+    """Copy opencode custom tool TypeScript files to target repo's .opencode/tools/.
+
+    Copies all *.ts files from the orch source .opencode/tools/ to the target
+    repo. Idempotent — overwrites existing files to keep tools in sync.
+    """
+    if not TOOLS_SOURCE_DIR.is_dir():
+        return
+    tools_dir = target_repo / ".opencode" / "tools"
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    for tool_file in sorted(TOOLS_SOURCE_DIR.glob("*.ts")):
+        dst = tools_dir / tool_file.name
+        if tool_file.resolve() != dst.resolve():
+            shutil.copy2(tool_file, dst)
+
+
+def setup_opencode_deps(target_repo: Path) -> None:
+    """Ensure .opencode/package.json exists and bun install has been run.
+
+    Copies package.json from the orch source .opencode/ if absent, then runs
+    bun install in the target's .opencode/ directory when node_modules is missing.
+    """
+    import subprocess
+
+    opencode_dir = target_repo / ".opencode"
+    opencode_dir.mkdir(parents=True, exist_ok=True)
+
+    pkg_source = _OPENCODE_SOURCE_DIR / "package.json"
+    pkg_target = opencode_dir / "package.json"
+    if not pkg_target.is_file() and pkg_source.is_file():
+        shutil.copy2(pkg_source, pkg_target)
+
+    if not (opencode_dir / "node_modules").is_dir():
+        subprocess.run(
+            ["bun", "install"],
+            cwd=opencode_dir,
+            check=False,
+            capture_output=True,
+        )
+
+
 def copy_prompt_files(
     configs: list[AgentConfig],
     *,
@@ -229,4 +281,6 @@ def copy_prompt_files(
             continue
         source = source_base / config.name / "prompt.md"
         if source.is_file():
-            shutil.copy2(source, prompts_dir / config.prompt_file)
+            dst = prompts_dir / config.prompt_file
+            if source.resolve() != dst.resolve():
+                shutil.copy2(source, dst)

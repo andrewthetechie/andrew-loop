@@ -56,7 +56,7 @@ def build_dispatch_prompt(
 
     # Workflow instructions
     target = AGENT_TARGET_STATE.get(agent_type, "Code Review")
-    sections.append(_workflow_section(ticket, agent_type, target))
+    sections.append(_workflow_section(ticket, agent_type, target, config=config))
 
     return "\n\n".join(sections)
 
@@ -92,6 +92,57 @@ def _comments_section(comments: list[dict[str, str]]) -> str:
 
 
 def _validation_section(config: dict[str, Any]) -> str:
+    """Render validation results or commands depending on agent role.
+
+    For reviewer/merger: the router pre-runs validators and passes results here.
+    For coder: lists the commands to run.
+
+    Plain-text format is used throughout — more reliable than JSON for
+    cost-optimised (Qwen-class) models reading a large context document.
+    """
+    results = config.get("validation_results")
+    if results:
+        n_pass = sum(1 for r in results if r.get("passed"))
+        n_fail = len(results) - n_pass
+        overall = "ALL PASS" if n_fail == 0 else f"{n_fail} FAILED, {n_pass} PASSED"
+
+        lines = [
+            "## Validation Results",
+            "These were run by the router before dispatch. Do not re-run them.",
+            f"Overall: {overall}",
+            "",
+        ]
+
+        for r in results:
+            exit_code = r.get("exit_code", 0)
+            status = "PASS" if r.get("passed") else "FAIL"
+            lines.append(f"### Validator: `{r['command']}`")
+            lines.append(f"Exit code: {exit_code} ({status})")
+
+            stdout = str(r.get("stdout", "")).strip()
+            stderr = str(r.get("stderr", "")).strip()
+
+            if stdout:
+                lines.append("Stdout:")
+                lines.append("```")
+                lines.append(stdout)
+                lines.append("```")
+            else:
+                lines.append("Stdout: (none)")
+
+            if stderr:
+                lines.append("Stderr:")
+                lines.append("```")
+                lines.append(stderr)
+                lines.append("```")
+            else:
+                lines.append("Stderr: (none)")
+
+            lines.append("")
+
+        return "\n".join(lines)
+
+    # Coder case — list commands to run
     cmds = config.get("validation_commands", [])
     lines = ["## Validation Commands"]
     if cmds:
@@ -109,10 +160,24 @@ def _pr_section(ticket: dict[str, Any]) -> str:
 
 def _review_section(config: dict[str, Any]) -> str:
     lines = ["## Review Results"]
+
+    # Extract the most recent REVIEW_DECISION marker from ticket comments.
+    # The reviewer writes a comment beginning with "## REVIEW_DECISION: <DECISION>"
+    # as the authoritative review record (GitHub formal reviews are unavailable
+    # in single-user workflows where the PR author and reviewer share an account).
+    decision = config.get("review_decision", "Not available")
+    review_comment = config.get("review_comment", "")
+    lines.append(f"- Decision: {decision}")
+    if review_comment:
+        lines.append(f"- Review Summary: {review_comment[:400]}")
+
+    # Legacy keys kept for backward compatibility
     for key in ("code_review_result", "security_review_result"):
-        val = config.get(key, "Not available")
-        label = key.replace("_", " ").title()
-        lines.append(f"- {label}: {val}")
+        val = config.get(key)
+        if val:
+            label = key.replace("_", " ").title()
+            lines.append(f"- {label}: {val}")
+
     return "\n".join(lines)
 
 
@@ -124,15 +189,30 @@ def _memory_section(models: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def _workflow_section(ticket: dict[str, Any], agent_type: str, target_state: str) -> str:
-    return "\n".join(
-        [
-            "## Workflow Instructions",
-            f"- Agent Role: {agent_type}",
-            f"- Current State: {ticket['state']}",
-            f"- Target State: {target_state}",
+def _workflow_section(
+    ticket: dict[str, Any],
+    agent_type: str,
+    target_state: str,
+    config: dict[str, Any] | None = None,
+) -> str:
+    config = config or {}
+    worktree_dir = config.get("worktree_dir", "")
+    step_budget = config.get("step_budget", 50) if config else 50
+    lines = [
+        "## Workflow Instructions",
+        f"- Agent Role: {agent_type}",
+        f"- Current State (pre-dispatch): {ticket['state']}",
+        f"  Note: ticket will read as 'In Progress' at runtime — this is normal.",
+        f"- Target State: {target_state}",
+        f"- Step Budget: {step_budget} (trigger continuation comment at step {int(step_budget) - 5})",
+    ]
+    if worktree_dir:
+        lines += [
+            f"- Working Directory: {worktree_dir}",
+            "- **All commands must run from the working directory above.**"
+            " Never `cd` outside it. All file paths are relative to this directory.",
         ]
-    )
+    return "\n".join(lines)
 
 
 async def fetch_mental_models(

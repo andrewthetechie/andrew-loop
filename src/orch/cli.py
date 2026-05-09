@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+
 import sys
 from pathlib import Path
 
@@ -75,14 +76,23 @@ def _strip_yaml_comments(content: str) -> str:
 @click.option(
     "--db",
     "db_path",
-    default=DEFAULT_DB_PATH,
+    default=None,
     envvar="ORCH_DB_PATH",
-    help="Path to the SQLite database.",
+    help="Path to the SQLite database. Defaults to ~/.local/share/orch/{repo_id}/state.db",
 )
 @click.pass_context
-def main(ctx: click.Context, db_path: str) -> None:
+def main(ctx: click.Context, db_path: str | None) -> None:
     """orch — deterministic orchestrator for the agent developer workflow."""
+    from orch.config import Config
+    from orch.state import state_db_path
+
     ctx.ensure_object(dict)
+
+    if db_path is None:
+        repo_root = Path.cwd()
+        cfg = Config.load(repo_root=repo_root)
+        db_path = str(state_db_path(repo_root, base_dir=cfg.state.base_dir))
+
     ctx.obj["db_path"] = db_path
 
 
@@ -95,10 +105,35 @@ def init(target_dir: str, no_externals: bool) -> None:
 
     async def _init() -> None:
         runner = None if no_externals else default_runner
-        result = await init_project(repo_root, run_external=runner)
-        for field in ("config", "db", "agents", "hindsight", "serena", "gitnexus"):
-            status = getattr(result, f"{field}_status")
-            console.print(f"  {field}: {status}")
+
+        def _print_step(name: str, status: str) -> None:
+            if status.startswith("indexing") or status.endswith("..."):
+                color = "cyan"
+            elif status in ("created", "exists"):
+                color = "green"
+            elif status == "skipped":
+                color = "yellow"
+            else:
+                color = "red"
+            console.print(f"  [{color}]{name}[/{color}]: {status}")
+
+        async def _prompt_bank_id(failed_bank_id: str) -> str | None:
+            console.print(
+                f"\n  [yellow]Could not reach Hindsight — bank '{failed_bank_id}' was not created.[/yellow]"
+                "\n  Enter an existing bank name to use, or leave blank to skip."
+            )
+            try:
+                new_id = click.prompt("  bank_id", default="", show_default=False)
+                return new_id.strip() or None
+            except click.Abort:
+                return None
+
+        result = await init_project(
+            repo_root,
+            run_external=runner,
+            on_step=_print_step,
+            on_hindsight_bank_failed=_prompt_bank_id,
+        )
 
     _run(_init())
 
@@ -291,6 +326,7 @@ def move(ctx: click.Context, ticket_id: str, new_state: str) -> None:
 @click.option("--state", help="New state.")
 @click.option("--linked-pr", help="PR URL.")
 @click.option("--assignee", help="Assignee.")
+@click.option("--reset-rework", "reset_rework", is_flag=True, help="Reset the rework loop count to 0.")
 @click.pass_context
 def update(
     ctx: click.Context,
@@ -298,6 +334,7 @@ def update(
     state: str | None,
     linked_pr: str | None,
     assignee: str | None,
+    reset_rework: bool,
 ) -> None:
     """Update specific fields on a ticket."""
 
@@ -305,13 +342,15 @@ def update(
         db_path = ctx.obj["db_path"]
         async with Database(Path(db_path)) as db:
             try:
-                fields = {}
+                fields: dict[str, object] = {}
                 if state is not None:
                     fields["state"] = state
                 if linked_pr is not None:
                     fields["linked_pr"] = linked_pr
                 if assignee is not None:
                     fields["assignee"] = assignee
+                if reset_rework:
+                    fields["rework_loop_count"] = 0
                 ticket = await update_ticket(db, ticket_id, **fields)
                 click.echo(f"Updated {ticket.id}")
             except ValueError as e:
@@ -426,6 +465,124 @@ def promote(ctx: click.Context, ticket_id: str | None) -> None:
 
     _run(_promote())
 
+
+@tickets.command("human-review")
+@click.pass_context
+def human_review_cmd(ctx: click.Context) -> None:
+    """Show all tickets requiring human attention (Needs Human Review + Human Merge)."""
+
+    _HUMAN_STATES = ("Needs Human Review", "Human Merge")
+
+    async def _review() -> None:
+        db_path = ctx.obj["db_path"]
+        async with Database(Path(db_path)) as db:
+            items = []
+            for state in _HUMAN_STATES:
+                items.extend(await list_tickets(db, state_filter=state))
+
+            if not items:
+                click.echo("No tickets require human attention.")
+                return
+
+            for ticket in items:
+                comments = await get_ticket_comments(db, ticket.id)
+                state_color = "red" if ticket.state == "Needs Human Review" else "yellow"
+                console.rule(
+                    f"[bold {state_color}]{ticket.id}[/bold {state_color}]"
+                    f" [{state_color}]{ticket.state}[/{state_color}] — {ticket.title}"
+                )
+                console.print(
+                    f"  Risk: {ticket.risk_score or '-'}"
+                    f"  |  Rework loops: {ticket.rework_loop_count}"
+                    f"  |  PR: {ticket.linked_pr or '-'}"
+                )
+                console.print()
+
+                # Show last router comment relevant to this state
+                escalation = next(
+                    (
+                        c for c in reversed(comments)
+                        if c.author == "router"
+                        and any(s in c.body for s in _HUMAN_STATES)
+                    ),
+                    None,
+                )
+                if escalation:
+                    console.print(escalation.body)
+
+                # Show last non-router comment (review findings, merger decision, etc.)
+                review = next(
+                    (c for c in reversed(comments) if c.author not in ("router",)), None
+                )
+                if review and review != escalation:
+                    console.rule(f"[dim]Last comment from {review.author}[/dim]", style="dim")
+                    console.print(review.body)
+
+                console.print()
+
+    _run(_review())
+
+
+
+@main.command("validate")
+@click.option("--dir", "target_dir", default=".", help="Directory to run validators in.")
+@click.option("--json", "as_json", is_flag=True, help="Output results as JSON.")
+def validate_cmd(target_dir: str, as_json: bool) -> None:
+    """Run all configured validation commands and report pass/fail.
+
+    Reads validation commands from config and runs them in the target directory.
+    Designed for use by the coder agent via the validate custom tool.
+    """
+    import json as _json
+    import subprocess
+
+    from orch.config import Config
+
+    repo_root = Path(target_dir).resolve()
+    cfg = Config.load(repo_root=repo_root)
+    commands = cfg.validation.commands
+
+    if not commands:
+        if as_json:
+            click.echo(_json.dumps({"commands": [], "all_passed": True, "results": []}))
+        else:
+            console.print("[yellow]No validation commands configured.[/yellow]")
+        return
+
+    results = []
+    for cmd in commands:
+        proc = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_root),
+        )
+        passed = proc.returncode == 0
+        results.append({
+            "command": cmd,
+            "exit_code": proc.returncode,
+            "passed": passed,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+        })
+
+    all_passed = all(r["passed"] for r in results)
+
+    if as_json:
+        click.echo(_json.dumps({"all_passed": all_passed, "results": results}, indent=2))
+        return
+
+    for r in results:
+        status = "[green]PASS[/green]" if r["passed"] else "[red]FAIL[/red]"
+        console.print(f"  {status}  `{r['command']}`  (exit {r['exit_code']})")
+        if not r["passed"]:
+            output = (r["stdout"] + "\n" + r["stderr"]).strip()
+            for line in output.splitlines()[-20:]:
+                console.print(f"        [dim]{line}[/dim]")
+
+    if not all_passed:
+        raise SystemExit(1)
 
 @main.command("status")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
@@ -583,16 +740,52 @@ def router(ctx: click.Context) -> None:
 
 @router.command()
 @click.option("--interval", default=10.0, type=float, help="Poll interval in seconds.")
+@click.option("--verbose", "-v", is_flag=True, help="Stream raw worker JSON to the terminal.")
+@click.option("--tui", "-t", is_flag=True, help="Show split-pane TUI with live status and parsed log.")
+@click.option("--manual-approval", "-m", is_flag=True, help="Pause before each dispatch and ask for confirmation.")
 @click.pass_context
-def start(ctx: click.Context, interval: float) -> None:
+def start(ctx: click.Context, interval: float, verbose: bool, tui: bool, manual_approval: bool) -> None:
     """Start the router polling loop."""
     import signal
+
+    from orch.config import Config
+    from orch.tui import RouterTUI
 
     async def _start() -> None:
         db_path = ctx.obj["db_path"]
         repo_root = Path.cwd()
+
+        # Load config and initialise Hindsight client if configured
+        cfg = Config.load(repo_root=repo_root)
+        hindsight_client = None
+        hindsight_bank_id = ""
+        if cfg.hindsight.url and cfg.hindsight.bank_id:
+            try:
+                from hindsight_client import Hindsight
+                hindsight_client = Hindsight(
+                    base_url=cfg.hindsight.url,
+                    api_key=cfg.hindsight.api_key or None,
+                )
+                # Bank ID is namespace-project, e.g. orchestra-jelly-swipe
+                hindsight_bank_id = f"{cfg.hindsight.bank_id}-{repo_root.name}"
+                console.print(
+                    f"[dim]Hindsight: {cfg.hindsight.url}  bank={hindsight_bank_id}[/dim]"
+                )
+            except Exception as exc:
+                console.print(f"[yellow]Hindsight unavailable ({exc}) — retention disabled[/yellow]")
+
         async with Database(Path(db_path)) as db:
-            r = Router(db, repo_root, poll_interval=interval)
+            router_tui = RouterTUI(console=console) if tui else None
+            r = Router(
+                db, repo_root,
+                poll_interval=interval,
+                verbose=verbose,
+                manual_approval=manual_approval,
+                console=console,
+                tui=router_tui,
+                hindsight_client=hindsight_client,
+                hindsight_bank_id=hindsight_bank_id,
+            )
 
             try:
                 loop = asyncio.get_event_loop()
@@ -602,7 +795,15 @@ def start(ctx: click.Context, interval: float) -> None:
                 pass
 
             console.print(f"[bold]Router started[/bold] (poll interval: {interval}s)")
-            await r.run()
+            if router_tui:
+                with router_tui:
+                    await r.run()
+            else:
+                await r.run()
+
+            if hindsight_client:
+                await hindsight_client.aclose()
+
             console.print("[bold]Router stopped.[/bold]")
 
     _run(_start())
