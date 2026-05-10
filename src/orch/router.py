@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -11,21 +12,22 @@ from pathlib import Path
 from rich.console import Console
 
 from orch.db import Database
-from orch.tui import RouterTUI
 from orch.hindsight import retain_human_intervention, retain_ticket_outcome
 from orch.prompt import build_dispatch_prompt
 from orch.tickets import (
     add_comment,
     get_next_routable,
+    get_routable_issue_ids,
     get_ticket,
     get_ticket_comments,
     ticket_to_dict,
     update_ticket,
 )
+from orch.tui import RouterTUI
 
 logger = logging.getLogger(__name__)
 
-CreateWorktree = Callable[[str, str, Path], Awaitable[None]]
+CreateWorktree = Callable[[str, str, Path, str], Awaitable[None]]
 RunAgent = Callable[[str, Path, str, str], Awaitable[int]]  # ticket_id, dir, agent_type, payload
 WebhookPost = Callable[..., Awaitable[int]]
 
@@ -39,8 +41,30 @@ AGENT_FOR_STATE: dict[str, str] = {
 }
 
 ROUTABLE_STATES = tuple(AGENT_FOR_STATE.keys())
+
+
+def feature_branch_name(issue_id: int | None) -> str:
+    """Derive the feature branch name from an issue ID.
+
+    Returns 'issue-N' when issue_id is set, 'main' otherwise.
+    """
+    if issue_id is not None:
+        return f"issue-{issue_id}"
+    return "main"
+
+
 MAX_REWORK_LOOPS = 3
 _REVIEW_DECISION_PREFIX = "## REVIEW_DECISION:"
+_PENDING_CHECK_STATES = {"EXPECTED", "IN_PROGRESS", "PENDING", "QUEUED", "REQUESTED", "WAITING"}
+_FAILING_CHECK_STATES = {
+    "ACTION_REQUIRED",
+    "CANCELLED",
+    "ERROR",
+    "FAILURE",
+    "STALE",
+    "STARTUP_FAILURE",
+    "TIMED_OUT",
+}
 
 
 def _extract_review_decision(
@@ -60,6 +84,48 @@ def _extract_review_decision(
     return "Not available", ""
 
 
+def _classify_status_check_rollup(rollup: list[object]) -> str:
+    """Classify GitHub statusCheckRollup data as pending, failed, or passed."""
+    saw_failure = False
+
+    for item in rollup:
+        if not isinstance(item, dict):
+            continue
+        values = {
+            str(value).upper()
+            for key in ("conclusion", "state", "status")
+            if (value := item.get(key)) is not None
+        }
+        if values & _PENDING_CHECK_STATES:
+            return "pending"
+        if values & _FAILING_CHECK_STATES:
+            saw_failure = True
+
+    if saw_failure:
+        return "failed"
+    return "passed"
+
+
+def _sum_step_finish_total_tokens(output: bytes) -> int:
+    """Sum `tokens.total` across all step_finish events in opencode stdout."""
+    total = 0
+    for raw_line in output.decode("utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if data.get("type") != "step_finish":
+            continue
+        part = data.get("part", {})
+        tokens = part.get("tokens", {})
+        value = tokens.get("total", 0)
+        if isinstance(value, int):
+            total += value
+    return total
+
 
 class Router:
     """Polls SQLite for routable tickets and dispatches the correct agent."""
@@ -70,12 +136,14 @@ class Router:
         repo_root: Path,
         *,
         poll_interval: float = 10.0,
+        issue_id: int | None = None,
         create_worktree: CreateWorktree | None = None,
         run_agent: RunAgent | None = None,
         webhook_post: WebhookPost | None = None,
         webhook_url: str = "",
         hindsight_client: object | None = None,
         hindsight_bank_id: str = "",
+        all_issues: bool = False,
         verbose: bool = False,
         manual_approval: bool = False,
         console: Console | None = None,
@@ -84,6 +152,8 @@ class Router:
         self._db = db
         self._repo_root = repo_root
         self._poll_interval = poll_interval
+        self._issue_id = issue_id
+        self._all_issues = all_issues
         self._create_worktree: CreateWorktree = create_worktree or self._default_create_worktree
         self._run_agent = run_agent or self._default_run_agent
         self._webhook_post = webhook_post
@@ -95,6 +165,45 @@ class Router:
         self._console = console or Console()
         self._tui = tui
         self._stop = asyncio.Event()
+        self._last_dispatch_tokens = 0
+
+    async def validate_feature_branch(self) -> None:
+        """Verify origin/issue-{N} exists when issue_id is set. Raises SystemExit if missing."""
+        if self._issue_id is None:
+            return
+
+        branch = feature_branch_name(self._issue_id)
+        exists = await self._check_remote_branch(branch)
+        if not exists:
+            self._log(
+                f"[red bold]Feature branch 'origin/{branch}' not found.[/red bold]\n"
+                f"  Create it with: git push origin <local-branch>:{branch}"
+            )
+            raise SystemExit(1)
+
+    async def _check_remote_branch(self, branch: str) -> bool:
+        """Check whether origin/<branch> exists after fetching."""
+        fetch = await asyncio.create_subprocess_exec(
+            "git",
+            "fetch",
+            "origin",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self._repo_root),
+        )
+        await fetch.communicate()
+
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/origin/{branch}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self._repo_root),
+        )
+        await proc.communicate()
+        return proc.returncode == 0
 
     def _log(self, msg: str) -> None:
         if self._tui:
@@ -105,7 +214,21 @@ class Router:
 
     async def poll_once(self) -> str | None:
         """Find next routable ticket (dependency-aware), dispatch it, return ticket ID or None."""
-        ticket_id = await get_next_routable(self._db, states=ROUTABLE_STATES)
+        # All-issues mode: pick the first issue on initial poll
+        if self._all_issues and self._issue_id is None:
+            await self._advance_to_next_issue()
+
+        ticket_id = await get_next_routable(
+            self._db, states=ROUTABLE_STATES, issue_id=self._issue_id
+        )
+
+        # All-issues mode: advance to next issue when current is exhausted
+        if ticket_id is None and self._all_issues:
+            next_issue = await self._advance_to_next_issue()
+            if next_issue is not None:
+                ticket_id = await get_next_routable(
+                    self._db, states=ROUTABLE_STATES, issue_id=self._issue_id
+                )
 
         if ticket_id is None:
             return None
@@ -113,6 +236,19 @@ class Router:
         ticket = await get_ticket(self._db, ticket_id)
         if ticket is None:
             return None
+
+        if ticket.state == "Code Review":
+            ci_gate = await self._apply_code_review_ci_gate(ticket)
+            if ci_gate == "skip":
+                return None
+            if ci_gate == "rerouted":
+                return ticket_id
+        if ticket.state == "Ready to Merge":
+            ready_gate = await self._apply_ready_to_merge_gate(ticket)
+            if ready_gate == "skip":
+                return None
+            if ready_gate == "rerouted":
+                return ticket_id
 
         # Rework loop escalation
         if ticket.state == "Rework" and ticket.rework_loop_count >= MAX_REWORK_LOOPS:
@@ -141,17 +277,31 @@ class Router:
 
         agent_type = AGENT_FOR_STATE.get(ticket.state, "coder")
 
-        if self._manual_approval and not await self._prompt_approval(ticket_id, agent_type, ticket):
+        if self._manual_approval and not await self._prompt_approval(
+            ticket_id, agent_type, ticket
+        ):
             self.stop()
             return None
 
         await self._dispatch(ticket_id, agent_type)
         return ticket_id
 
+    async def _advance_to_next_issue(self) -> int | None:
+        """Find the next issue with routable tickets, update _issue_id, return it or None."""
+        issue_ids = await get_routable_issue_ids(self._db, states=ROUTABLE_STATES)
+        # Find the first issue_id greater than the current one
+        for iid in issue_ids:
+            if self._issue_id is None or iid > self._issue_id:
+                self._log(f"[cyan]⟫[/cyan] Switching to issue [bold]#{iid}[/bold]")
+                self._issue_id = iid
+                return iid
+        return None
+
     async def _dispatch(self, ticket_id: str, agent_type: str) -> None:
         """Move ticket to In Progress, create worktree, launch agent, handle result."""
         from orch.config import Config as _Config
         from orch.state import resolve_state_dir as _resolve_state_dir
+
         _cfg = _Config.load(repo_root=self._repo_root)
         _state_dir = _resolve_state_dir(self._repo_root, base_dir=_cfg.state.base_dir)
         worktree_dir = _state_dir / "worktrees" / ticket_id
@@ -168,16 +318,24 @@ class Router:
         if ticket is None:
             return
 
-        await self._create_worktree(ticket_id, branch, worktree_dir)
+        base_ref = f"origin/{feature_branch_name(ticket.issue_id)}"
+        await self._create_worktree(ticket_id, branch, worktree_dir, base_ref)
 
         if not worktree_dir.is_dir():
             logger.error("Worktree directory missing after creation attempt: %s", worktree_dir)
             await update_ticket(self._db, ticket_id, state="Needs Human Review")
             await add_comment(
-                self._db, ticket_id,
+                self._db,
+                ticket_id,
                 f"Router could not create worktree at {worktree_dir}. Check git worktree state.",
                 author="router",
             )
+            return
+
+        # Worktree setup (e.g. rebase on re-dispatch) may have gated the ticket to a
+        # terminal state — abort dispatch without invoking the agent.
+        ticket = await get_ticket(self._db, ticket_id)
+        if ticket is None or ticket.state != "In Progress":
             return
 
         self._sync_opencode_to_worktree(worktree_dir)
@@ -186,9 +344,11 @@ class Router:
         comments_data = [{"author": c.author, "body": c.body} for c in comments]
 
         from orch.config import Config
+
         cfg = Config.load(repo_root=self._repo_root)
 
         import json as _json
+
         opencode_json = self._repo_root / "opencode.json"
         step_budget = 50
         model_name = ""
@@ -232,7 +392,8 @@ class Router:
                     # Move back to To Do — the user needs to fix things first
                     await update_ticket(self._db, ticket_id, state="To Do")
                     await add_comment(
-                        self._db, ticket_id,
+                        self._db,
+                        ticket_id,
                         "Router halted dispatch: pre-existing validation failures detected. "
                         "Fix the failing validators and re-queue the ticket.",
                         author="router",
@@ -250,6 +411,7 @@ class Router:
             dispatch_config["validation_results"] = val_results
             if self._hindsight_client and self._hindsight_bank_id:
                 from orch.hindsight import retain_validation_results
+
                 await retain_validation_results(
                     self._hindsight_client,
                     ticket_id,
@@ -257,11 +419,74 @@ class Router:
                     validation_results=val_results,
                     bank_id=self._hindsight_bank_id,
                 )
+            if agent_type == "reviewer":
+                failed_results = [result for result in val_results if not result.get("passed")]
+                if failed_results:
+                    failed_commands = ", ".join(
+                        (
+                            f"{result.get('command', '<unknown>')} "
+                            f"(exit {result.get('exit_code', '?')})"
+                        )
+                        for result in failed_results
+                    )
+                    await update_ticket(self._db, ticket_id, state="Rework")
+                    await add_comment(
+                        self._db,
+                        ticket_id,
+                        "\n".join(
+                            [
+                                "## ROUTER_GATE: VALIDATION_FAILED",
+                                "",
+                                (
+                                    "**Result:** Validation failed before reviewer dispatch: "
+                                    f"{failed_commands}"
+                                ),
+                                "**Action:** moved to `Rework` without invoking reviewer.",
+                            ]
+                        ),
+                        author="router",
+                    )
+                    if self._tui:
+                        self._tui.set_ticket_state("Rework")
+                    self._log(
+                        f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold]"
+                        " reviewer gate failed → Rework"
+                    )
+                    return
+
+        # Mergeability gate for reviewer — short-circuit if PR has conflicts.
+        if agent_type == "reviewer" and ticket.linked_pr:
+            mergeable = await self._check_pr_mergeability(ticket.linked_pr)
+            if mergeable != "MERGEABLE":
+                await update_ticket(self._db, ticket_id, state="Rework")
+                await add_comment(
+                    self._db,
+                    ticket_id,
+                    "\n".join(
+                        [
+                            "## ROUTER_GATE: MERGE_CONFLICT",
+                            "",
+                            f"**Result:** PR mergeability is `{mergeable}`",
+                            "**Action:** moved to `Rework` without invoking reviewer.",
+                        ]
+                    ),
+                    author="router",
+                )
+                if self._tui:
+                    self._tui.set_ticket_state("Rework")
+                self._log(
+                    f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold]"
+                    " reviewer mergeability gate failed → Rework"
+                )
+                return
 
         if self._tui:
             total = await self._db.count_tickets()
             self._tui.set_dispatching(
-                ticket_id, ticket.title, ticket.state, agent_type,
+                ticket_id,
+                ticket.title,
+                ticket.state,
+                agent_type,
                 total_tickets=total,
                 model=str(model_name),
                 step_budget=int(step_budget),
@@ -281,9 +506,23 @@ class Router:
         dispatch_file = worktree_dir / f"ORCH_DISPATCH_{ticket_id}.md"
         dispatch_file.write_text(payload)
 
-        prompt = f"Read ORCH_DISPATCH_{ticket_id}.md in the current directory for your full dispatch payload, then begin."
+        prompt = (
+            f"Read ORCH_DISPATCH_{ticket_id}.md in the current"
+            " directory for your full dispatch payload, then begin."
+        )
 
+        self._last_dispatch_tokens = 0
         exit_code = await self._run_agent(ticket_id, worktree_dir, agent_type, prompt)
+        if exit_code == 0:
+            from orch.metrics import record_ticket_metric
+
+            await record_ticket_metric(
+                self._db,
+                ticket_id=ticket_id,
+                agent_type=agent_type,
+                model=str(model_name),
+                total_tokens=int(self._last_dispatch_tokens),
+            )
 
         ticket = await get_ticket(self._db, ticket_id)
         if ticket is None:
@@ -299,25 +538,30 @@ class Router:
             if exit_code == 0 and agent_type == "coder":
                 next_state = "Rework"
                 self._log(
-                    f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold] coder exited 0 without completing"
+                    f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold]"
+                    " coder exited 0 without completing"
                     " → Rework (likely hit step limit)"
                 )
             else:
                 next_state = "Needs Human Review"
                 self._log(
-                    f"[red]✗[/red] [bold]{ticket_id}[/bold] agent exited {exit_code} without completing"
-                    f" → {next_state}"
+                    f"[red]✗[/red] [bold]{ticket_id}[/bold]"
+                    f" agent exited {exit_code} without"
+                    f" completing → {next_state}"
                 )
             if self._tui:
                 self._tui.set_ticket_state(next_state)
             await update_ticket(self._db, ticket_id, state=next_state)
-            escalation_body = await self._build_escalation_comment(ticket_id, exit_code, agent_type)
+            escalation_body = await self._build_escalation_comment(
+                ticket_id, exit_code, agent_type
+            )
             await add_comment(self._db, ticket_id, escalation_body, author="router")
             if next_state == "Needs Human Review":
                 await self._fire_webhook(ticket_id, "In Progress", "Needs Human Review")
         else:
             self._log(
-                f"[green]✓[/green] [bold]{ticket_id}[/bold] exit {exit_code} → [bold]{ticket.state}[/bold]"
+                f"[green]✓[/green] [bold]{ticket_id}[/bold]"
+                f" exit {exit_code} → [bold]{ticket.state}[/bold]"
             )
 
         if self._tui:
@@ -325,10 +569,13 @@ class Router:
 
     async def _worktree_has_commits(self, worktree_dir: Path) -> bool:
         """Return True if the worktree branch has any commits beyond its base."""
-        if not worktree_dir.is_dir():
+        if not worktree_dir.is_dir():  # noqa: ASYNC240
             return False
         proc = await asyncio.create_subprocess_exec(
-            "git", "log", "--oneline", "origin/main..HEAD",
+            "git",
+            "log",
+            "--oneline",
+            "origin/main..HEAD",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(worktree_dir),
@@ -350,9 +597,7 @@ class Router:
         """
         import sys
 
-        self._log(
-            f"  [dim]baseline validation for {ticket_id} before coder dispatch…[/dim]"
-        )
+        self._log(f"  [dim]baseline validation for {ticket_id} before coder dispatch…[/dim]")
         results = await self._run_validation(worktree_dir, commands)
         failures = [r for r in results if not r.get("passed")]
 
@@ -390,12 +635,13 @@ class Router:
                 sys.stdout.flush()
                 try:
                     answer = sys.stdin.readline().strip().lower()
-                except (EOFError, KeyboardInterrupt):
+                except EOFError, KeyboardInterrupt:
                     return False
 
                 if answer == "skip":
                     self._log(
-                        f"[yellow]⚠[/yellow] {ticket_id} skipped — fix baseline validation and re-queue"
+                        f"[yellow]⚠[/yellow] {ticket_id} skipped"
+                        " — fix baseline validation and re-queue"
                     )
                     return False
 
@@ -404,11 +650,14 @@ class Router:
                 results = await self._run_validation(worktree_dir, commands)
                 failures = [r for r in results if not r.get("passed")]
                 if not failures:
-                    self._console.print(f"  [green]✓ All validators passing — dispatching {ticket_id}[/green]\n")
+                    self._console.print(
+                        f"  [green]✓ All validators passing — dispatching {ticket_id}[/green]\n"
+                    )
                     return True
 
                 self._console.print(
-                    f"  [red]Still {len(failures)} failing.[/red] Fix and press Enter again, or type 'skip':\n"
+                    f"  [red]Still {len(failures)} failing.[/red]"
+                    " Fix and press Enter again, or type 'skip':\n"
                 )
         finally:
             if self._tui:
@@ -438,7 +687,9 @@ class Router:
         def _truncate(text: str, max_lines: int = 60) -> str:
             lines = text.splitlines()
             if len(lines) > max_lines:
-                return f"... ({len(lines) - max_lines} lines truncated)\n" + "\n".join(lines[-max_lines:])
+                return f"... ({len(lines) - max_lines} lines truncated)\n" + "\n".join(
+                    lines[-max_lines:]
+                )
             return text
 
         for cmd in commands:
@@ -453,50 +704,311 @@ class Router:
             exit_code = proc.returncode or 0
             passed = exit_code == 0
 
-            results.append({
-                "command": cmd,
-                "exit_code": exit_code,
-                "passed": passed,
-                "stdout": _truncate(raw_stdout.decode(errors="replace").strip()),
-                "stderr": _truncate(raw_stderr.decode(errors="replace").strip()),
-            })
+            results.append(
+                {
+                    "command": cmd,
+                    "exit_code": exit_code,
+                    "passed": passed,
+                    "stdout": _truncate(raw_stdout.decode(errors="replace").strip()),
+                    "stderr": _truncate(raw_stderr.decode(errors="replace").strip()),
+                }
+            )
             status = "[green]✓[/green]" if passed else "[red]✗[/red]"
             self._log(f"  {status} [dim]{cmd}[/dim]  exit={exit_code}")
 
         return results
 
-    async def _build_escalation_comment(self, ticket_id: str, exit_code: int, agent_type: str) -> str:
+    async def _check_pr_mergeability(self, pr_url: str) -> str:
+        """Check GitHub PR mergeability via gh CLI.
+
+        Returns 'MERGEABLE', 'CONFLICTING', or 'UNKNOWN'.
+        """
+        import json
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "gh",
+                "pr",
+                "view",
+                pr_url,
+                "--json",
+                "mergeable",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            data = json.loads(stdout.decode(errors="replace"))
+            return str(data.get("mergeable", "UNKNOWN"))
+        except Exception:
+            return "UNKNOWN"
+
+    async def _load_pr_status_check_rollup(self, pr_ref: str) -> list[object] | None:
+        """Fetch GitHub statusCheckRollup for a linked PR, or None if unavailable."""
+        proc = await asyncio.create_subprocess_exec(
+            "gh",
+            "pr",
+            "view",
+            pr_ref,
+            "--json",
+            "statusCheckRollup",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(self._repo_root),
+        )
+        raw_stdout, raw_stderr = await proc.communicate()
+        if proc.returncode:
+            stderr = raw_stderr.decode(errors="replace").strip()
+            logger.warning("gh pr view failed for %s: %s", pr_ref, stderr)
+            return None
+
+        try:
+            payload = json.loads(raw_stdout.decode(errors="replace") or "{}")
+        except json.JSONDecodeError:
+            logger.warning("Invalid gh pr view JSON for %s", pr_ref)
+            return None
+
+        rollup = payload.get("statusCheckRollup")
+        if isinstance(rollup, list):
+            return rollup
+        return None
+
+    async def _apply_code_review_ci_gate(self, ticket: object) -> str:
+        """Apply deterministic CI gating for Code Review tickets."""
+        linked_pr = getattr(ticket, "linked_pr", "") or ""
+        if not linked_pr:
+            return "allow"
+
+        rollup = await self._load_pr_status_check_rollup(str(linked_pr))
+        if rollup is None:
+            return "allow"
+
+        gate_status = _classify_status_check_rollup(rollup)
+        ticket_id = str(getattr(ticket, "id", ""))
+
+        if gate_status == "pending":
+            self._log(
+                f"[dim]↺[/dim] [bold]{ticket_id}[/bold]"
+                " reviewer gate waiting on CI; skipping this poll"
+            )
+            return "skip"
+
+        if gate_status == "failed":
+            await update_ticket(self._db, ticket_id, state="Rework")
+            await add_comment(
+                self._db,
+                ticket_id,
+                "\n".join(
+                    [
+                        "## ROUTER_GATE: CI_FAILED",
+                        "",
+                        f"**Result:** Required CI checks failed for linked PR {linked_pr}.",
+                        "**Action:** moved to `Rework` without invoking reviewer.",
+                    ]
+                ),
+                author="router",
+            )
+            if self._tui:
+                self._tui.set_ticket_state("Rework")
+            self._log(
+                f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold] reviewer gate failed CI → Rework"
+            )
+            return "rerouted"
+
+        return "allow"
+
+    async def _apply_ready_to_merge_gate(self, ticket: object) -> str:
+        """Apply deterministic gating for merger dispatch.
+
+        Checks (in order): risk score, review decision, PR mergeability, required CI.
+        Returns 'allow', 'skip', or 'rerouted'.
+        """
+        ticket_id = str(getattr(ticket, "id", ""))
+        risk_score = getattr(ticket, "risk_score", None)
+
+        if not isinstance(risk_score, int) or not (1 <= risk_score <= 5):
+            await update_ticket(self._db, ticket_id, state="Needs Human Review")
+            await add_comment(
+                self._db,
+                ticket_id,
+                "\n".join(
+                    [
+                        "## ROUTER_GATE: RISK_SCORE_INVALID",
+                        "",
+                        f"**Result:** Ticket risk score is missing or invalid: {risk_score!r}.",
+                        "**Action:** moved to `Needs Human Review` without invoking merger.",
+                    ]
+                ),
+                author="router",
+            )
+            if self._tui:
+                self._tui.set_ticket_state("Needs Human Review")
+            self._log(
+                f"[red]↑[/red] [bold]{ticket_id}[/bold]"
+                " merger gate missing valid risk score → Needs Human Review"
+            )
+            await self._fire_webhook(ticket_id, "Ready to Merge", "Needs Human Review")
+            return "rerouted"
+
+        if risk_score >= 4:
+            await update_ticket(self._db, ticket_id, state="Human Merge")
+            await add_comment(
+                self._db,
+                ticket_id,
+                "\n".join(
+                    [
+                        "## ROUTER_GATE: RISK_REQUIRES_HUMAN_MERGE",
+                        "",
+                        f"**Result:** Ticket risk score {risk_score} requires human merge.",
+                        "**Action:** moved to `Human Merge` without invoking merger.",
+                    ]
+                ),
+                author="router",
+            )
+            if self._tui:
+                self._tui.set_ticket_state("Human Merge")
+            self._log(
+                f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold]"
+                " merger gate routed high-risk ticket → Human Merge"
+            )
+            await self._fire_webhook(ticket_id, "Ready to Merge", "Human Merge")
+            return "rerouted"
+
+        comments = await get_ticket_comments(self._db, ticket_id)
+        review_decision, _review_comment = _extract_review_decision(comments)
+
+        if review_decision != "APPROVED":
+            gate_state = "Needs Human Review"
+            gate_name = "REVIEW_DECISION_MISSING"
+            result = f"Latest review decision is {review_decision}."
+            action = "moved to `Needs Human Review` without invoking merger."
+
+            if review_decision == "CHANGES_REQUESTED":
+                gate_state = "Rework"
+                gate_name = "REVIEW_CHANGES_REQUESTED"
+                action = "moved to `Rework` without invoking merger."
+            elif review_decision == "NEEDS_HUMAN_REVIEW":
+                gate_name = "REVIEW_NEEDS_HUMAN_REVIEW"
+
+            await update_ticket(self._db, ticket_id, state=gate_state)
+            await add_comment(
+                self._db,
+                ticket_id,
+                "\n".join(
+                    [
+                        f"## ROUTER_GATE: {gate_name}",
+                        "",
+                        f"**Result:** {result}",
+                        f"**Action:** {action}",
+                    ]
+                ),
+                author="router",
+            )
+            if self._tui:
+                self._tui.set_ticket_state(gate_state)
+            self._log(
+                f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold]"
+                f" merger gate routed review decision → {gate_state}"
+            )
+            if gate_state in WEBHOOK_TRIGGER_STATES:
+                await self._fire_webhook(ticket_id, "Ready to Merge", gate_state)
+            return "rerouted"
+
+        # PR mergeability gate — skip if no linked PR.
+        linked_pr = str(getattr(ticket, "linked_pr", "") or "")
+        if linked_pr:
+            mergeable = await self._check_pr_mergeability(linked_pr)
+            if mergeable == "CONFLICTING":
+                await update_ticket(self._db, ticket_id, state="Rework")
+                await add_comment(
+                    self._db,
+                    ticket_id,
+                    "\n".join(
+                        [
+                            "## ROUTER_GATE: MERGE_CONFLICT",
+                            "",
+                            f"**Result:** PR mergeability is `{mergeable}`",
+                            "**Action:** moved to `Rework` without invoking merger.",
+                        ]
+                    ),
+                    author="router",
+                )
+                if self._tui:
+                    self._tui.set_ticket_state("Rework")
+                self._log(
+                    f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold]"
+                    " merger mergeability gate failed → Rework"
+                )
+                return "rerouted"
+
+            # Required CI checks gate.
+            rollup = await self._load_pr_status_check_rollup(linked_pr)
+            if rollup is not None:
+                gate_status = _classify_status_check_rollup(rollup)
+                if gate_status == "pending":
+                    self._log(
+                        f"[dim]↺[/dim] [bold]{ticket_id}[/bold]"
+                        " merger gate waiting on CI; skipping this poll"
+                    )
+                    return "skip"
+                if gate_status == "failed":
+                    await update_ticket(self._db, ticket_id, state="Rework")
+                    await add_comment(
+                        self._db,
+                        ticket_id,
+                        "\n".join(
+                            [
+                                "## ROUTER_GATE: CI_FAILED",
+                                "",
+                                "**Result:** Required CI checks failed"
+                                f" for linked PR {linked_pr}.",
+                                "**Action:** moved to `Rework` without invoking merger.",
+                            ]
+                        ),
+                        author="router",
+                    )
+                    if self._tui:
+                        self._tui.set_ticket_state("Rework")
+                    self._log(
+                        f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold]"
+                        " merger gate failed CI → Rework"
+                    )
+                    return "rerouted"
+
+        return "allow"
+
+    async def _build_escalation_comment(
+        self, ticket_id: str, exit_code: int, agent_type: str
+    ) -> str:
         """Build an informative NHR escalation comment summarising what happened."""
         comments = await get_ticket_comments(self._db, ticket_id)
         ticket = await get_ticket(self._db, ticket_id)
         rework_count = getattr(ticket, "rework_loop_count", 0) if ticket else 0
 
         lines = [
-            f"## Needs Human Review — escalated by router",
-            f"",
-            f"**Agent:** {agent_type}  |  **Exit code:** {exit_code}  |  **Rework loops:** {rework_count}",
-            f"",
-            f"**Reason:** The agent exited without moving this ticket to the expected next state.",
+            "## Needs Human Review — escalated by router",
+            "",
+            f"**Agent:** {agent_type}  |  **Exit code:** {exit_code}"
+            f"  |  **Rework loops:** {rework_count}",
+            "",
+            "**Reason:** The agent exited without moving this ticket to the expected next state.",
         ]
 
         # Find the most recent non-router comment (reviewer/coder findings)
-        review_comment = next(
-            (c for c in reversed(comments) if c.author not in ("router",)), None
-        )
+        review_comment = next((c for c in reversed(comments) if c.author not in ("router",)), None)
         if review_comment:
             preview = review_comment.body[:600]
             if len(review_comment.body) > 600:
                 preview += "\n... *(truncated — see full comment above)*"
             lines += [
-                f"",
+                "",
                 f"**Last agent comment** (from {review_comment.author}):",
-                f"",
+                "",
                 preview,
             ]
 
         lines += [
-            f"",
-            f"**To resume:** move this ticket to `Rework` once the issues above are addressed.",
+            "",
+            "**To resume:** move this ticket to `Rework` once the issues above are addressed.",
         ]
         return "\n".join(lines)
 
@@ -570,9 +1082,12 @@ class Router:
             sys.stdout.flush()
             try:
                 answer = sys.stdin.readline().strip().lower()
-                return answer in ("", "y", "yes")
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
                 return False
+            except KeyboardInterrupt:
+                return False
+            else:
+                return answer in ("", "y", "yes")
         finally:
             if self._tui:
                 self._tui.resume()
@@ -666,26 +1181,37 @@ class Router:
         if src_pkg.is_file() and not dst_pkg.exists():
             shutil.copy2(src_pkg, dst_pkg)
 
-    async def _default_create_worktree(self, ticket_id: str, branch: str, worktree_dir: Path) -> None:
+    async def _default_create_worktree(
+        self, ticket_id: str, branch: str, worktree_dir: Path, base_ref: str = "origin/main"
+    ) -> None:
         worktree_dir.parent.mkdir(parents=True, exist_ok=True)
 
-        if worktree_dir.is_dir():
-            # Worktree already exists (re-dispatch) — nothing to do
+        if worktree_dir.is_dir():  # noqa: ASYNC240
+            # Worktree already exists (re-dispatch) — fetch and rebase onto latest base.
+            await self._rebase_existing_worktree(ticket_id, worktree_dir, base_ref)
             return
 
         # Fetch origin so we always branch from the latest merged state.
         # This prevents merge conflicts caused by PRs merged since the last fetch.
         fetch = await asyncio.create_subprocess_exec(
-            "git", "fetch", "origin",
+            "git",
+            "fetch",
+            "origin",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self._repo_root),
         )
         await fetch.communicate()
 
-        # Create the worktree branching from origin/main (not local HEAD)
+        # Create the worktree branching from the feature branch (or origin/main for legacy)
         proc = await asyncio.create_subprocess_exec(
-            "git", "worktree", "add", str(worktree_dir), "-b", branch, "origin/main",
+            "git",
+            "worktree",
+            "add",
+            str(worktree_dir),
+            "-b",
+            branch,
+            base_ref,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self._repo_root),
@@ -700,7 +1226,11 @@ class Router:
                 branch,
             )
             proc2 = await asyncio.create_subprocess_exec(
-                "git", "worktree", "add", str(worktree_dir), branch,
+                "git",
+                "worktree",
+                "add",
+                str(worktree_dir),
+                branch,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(self._repo_root),
@@ -712,15 +1242,117 @@ class Router:
                     branch,
                     stderr2.decode(errors="replace").strip(),
                 )
-        # _sync_opencode_to_worktree is called by _dispatch after this returns
-        # _sync_opencode_to_worktree is called by _dispatch after this returns
-        # _sync_opencode_to_worktree is called by _dispatch after this returns
+
+    async def _rebase_existing_worktree(
+        self, ticket_id: str, worktree_dir: Path, base_ref: str
+    ) -> None:
+        """Fetch origin and rebase the existing worktree onto base_ref.
+
+        If the worktree has uncommitted changes (e.g. coder exhausted its step budget
+        before committing), auto-commits them as a WIP commit so git rebase can run.
+        On conflict: aborts the rebase, moves ticket to Needs Human Review, and adds a
+        structured router gate comment. On success: returns silently.
+        """
+        fetch = await asyncio.create_subprocess_exec(
+            "git",
+            "fetch",
+            "origin",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(worktree_dir),
+        )
+        await fetch.communicate()
+
+        # Check for uncommitted changes — git rebase refuses to run with a dirty tree.
+        status_proc = await asyncio.create_subprocess_exec(
+            "git",
+            "status",
+            "--porcelain",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(worktree_dir),
+        )
+        status_out, _ = await status_proc.communicate()
+        if status_out.strip():
+            # Dirty worktree (agent likely hit step budget before committing).
+            # Auto-commit as WIP so the rebase can proceed.
+            add_proc = await asyncio.create_subprocess_exec(
+                "git",
+                "add",
+                "-A",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(worktree_dir),
+            )
+            await add_proc.communicate()
+            commit_proc = await asyncio.create_subprocess_exec(
+                "git",
+                "commit",
+                "-m",
+                f"WIP [{ticket_id}]: auto-committed by router before rework rebase",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(worktree_dir),
+            )
+            await commit_proc.communicate()
+            self._log(
+                f"[yellow]⚙[/yellow] [bold]{ticket_id}[/bold]"
+                " uncommitted changes auto-committed as WIP before rework rebase"
+            )
+
+        rebase = await asyncio.create_subprocess_exec(
+            "git",
+            "rebase",
+            base_ref,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(worktree_dir),
+        )
+        _, rebase_stderr = await rebase.communicate()
+
+        if rebase.returncode == 0:
+            return
+
+        # Rebase failed — abort and escalate to human review.
+        abort = await asyncio.create_subprocess_exec(
+            "git",
+            "rebase",
+            "--abort",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(worktree_dir),
+        )
+        await abort.communicate()
+
+        stderr_text = rebase_stderr.decode(errors="replace").strip()
+        comment_lines = [
+            "## ROUTER_GATE: REBASE_CONFLICT",
+            "",
+            f"**Result:** Rebase onto `{base_ref}` failed with conflicts.",
+            "**Action:** moved to `Needs Human Review`. Resolve conflicts manually and re-queue.",
+        ]
+        if stderr_text:
+            comment_lines += ["", f"```\n{stderr_text}\n```"]
+
+        await update_ticket(self._db, ticket_id, state="Needs Human Review")
+        await add_comment(
+            self._db,
+            ticket_id,
+            "\n".join(comment_lines),
+            author="router",
+        )
+        if self._tui:
+            self._tui.set_ticket_state("Needs Human Review")
+        self._log(f"[red]↑[/red] [bold]{ticket_id}[/bold] rebase conflict → Needs Human Review")
+        await self._fire_webhook(ticket_id, "In Progress", "Needs Human Review")
 
     def _db_path_abs(self) -> str:
         """Return the absolute path to the SQLite database."""
         return str(self._db.path.resolve())
 
-    async def _default_run_agent(self, ticket_id: str, worktree_dir: Path, agent_type: str, payload: str) -> int:
+    async def _default_run_agent(
+        self, ticket_id: str, worktree_dir: Path, agent_type: str, payload: str
+    ) -> int:
         import os
 
         log_dir = worktree_dir.parent.parent / "logs"  # state_dir/logs/
@@ -765,7 +1397,8 @@ class Router:
                         self._tui.log(f"  [dim]{line.decode(errors='replace').rstrip()}[/dim]")
                 elif self._verbose:
                     self._console.print(
-                        f"  [dim]{ticket_id}[/dim] [dim]{label}[/dim] {line.decode(errors='replace').rstrip()}"
+                        f"  [dim]{ticket_id}[/dim] [dim]{label}[/dim]"
+                        f" {line.decode(errors='replace').rstrip()}"
                     )
 
         await asyncio.gather(
@@ -776,6 +1409,7 @@ class Router:
 
         stdout = b"".join(stdout_chunks)
         stderr = b"".join(stderr_chunks)
+        self._last_dispatch_tokens = _sum_step_finish_total_tokens(stdout)
         log_file.write_bytes(b"=== STDOUT ===\n" + stdout + b"\n=== STDERR ===\n" + stderr)
         self._log(f"  [dim]{ticket_id} log → {log_file}[/dim]")
 

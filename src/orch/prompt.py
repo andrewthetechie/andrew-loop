@@ -202,9 +202,10 @@ def _workflow_section(
         "## Workflow Instructions",
         f"- Agent Role: {agent_type}",
         f"- Current State (pre-dispatch): {ticket['state']}",
-        f"  Note: ticket will read as 'In Progress' at runtime — this is normal.",
+        "  Note: ticket will read as 'In Progress' at runtime — this is normal.",
         f"- Target State: {target_state}",
-        f"- Step Budget: {step_budget} (trigger continuation comment at step {int(step_budget) - 5})",
+        f"- Step Budget: {step_budget}"
+        f" (trigger continuation comment at step {int(step_budget) - 5})",
     ]
     if worktree_dir:
         lines += [

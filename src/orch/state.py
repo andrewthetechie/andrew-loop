@@ -25,8 +25,9 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tomllib
 from pathlib import Path
-
+from typing import Any
 
 _ORCHESTRA_ID_FILE = ".orchestra-id"
 
@@ -99,3 +100,33 @@ def resolve_state_dir(repo_root: Path, *, base_dir: str | None = None) -> Path:
 def state_db_path(repo_root: Path, *, base_dir: str | None = None) -> Path:
     """Return the SQLite database path for a repo."""
     return resolve_state_dir(repo_root, base_dir=base_dir) / "state.db"
+
+
+def read_active_issue(repo_root: Path, *, base_dir: str | None = None) -> int | None:
+    """Read active_issue from the state dir config, or None if absent."""
+    config_path = resolve_state_dir(repo_root, base_dir=base_dir) / "config.toml"
+    if not config_path.is_file():
+        return None
+    with config_path.open("rb") as f:
+        data = tomllib.load(f)
+    value = data.get("active_issue")
+    if value is None:
+        return None
+    return int(value)
+
+
+def write_active_issue(repo_root: Path, issue_id: int, *, base_dir: str | None = None) -> None:
+    """Write active_issue to the state dir config, creating the file if needed."""
+    config_path = resolve_state_dir(repo_root, base_dir=base_dir) / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data: dict[str, Any] = {}
+    if config_path.is_file():
+        with config_path.open("rb") as f:
+            data = tomllib.load(f)
+
+    data["active_issue"] = issue_id
+    with config_path.open("wb") as f:
+        import tomli_w
+
+        tomli_w.dump(data, f)

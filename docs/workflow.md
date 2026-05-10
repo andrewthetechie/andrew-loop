@@ -85,7 +85,7 @@ model = "claude-sonnet-4-6"
 model = "claude-sonnet-4-6"
 
 [agents.merger]
-model = "claude-sonnet-4-6"
+model = "qwen/qwen-2.5-coder"
 
 [agents.decomposer]
 model = "claude-opus-4-6"

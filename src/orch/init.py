@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -39,7 +39,7 @@ def _ensure_gitignore(repo_root: Path) -> None:
     if not additions:
         return
     sep = "\n" if existing and not existing.endswith("\n") else ""
-    block = "\n".join(["", "# orch agent system"] + additions + [""])
+    block = "\n".join(["", "# orch agent system", *additions, ""])
     gitignore.write_text(existing + sep + block)
 
 
@@ -50,11 +50,39 @@ def _update_config_bank_id(config_path: Path, new_bank_id: str) -> None:
     if updated == text:
         # bank_id line not present yet — append to [hindsight] section
         updated = re.sub(
-            r'(\[hindsight\][^\[]*)',
+            r"(\[hindsight\][^\[]*)",
             lambda m: m.group(0).rstrip() + f'\nbank_id = "{new_bank_id}"\n',
             text,
         )
     config_path.write_text(updated)
+
+
+def _make_alembic_cfg(db_path: Path) -> object:
+    from alembic.config import Config as AlembicConfig
+
+    # Locate alembic.ini and migrations/ relative to this file so the paths
+    # are correct regardless of the caller's working directory.
+    alembic_ini = Path(__file__).parent.parent.parent / "alembic.ini"
+    migrations_dir = alembic_ini.parent / "migrations"
+    cfg = AlembicConfig(str(alembic_ini))
+    cfg.set_main_option("script_location", str(migrations_dir))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    return cfg
+
+
+def _alembic_upgrade(db_path: Path) -> None:
+    """Run ``alembic upgrade head`` against an existing database."""
+    from alembic import command as alembic_command
+
+    alembic_command.upgrade(_make_alembic_cfg(db_path), "head")
+
+
+def _alembic_stamp(db_path: Path, revision: str = "head") -> None:
+    """Stamp a freshly-created database so Alembic knows it is already at head."""
+    from alembic import command as alembic_command
+
+    alembic_command.stamp(_make_alembic_cfg(db_path), revision)
+
 
 _DEFAULT_CONFIG = """\
 [router]
@@ -86,7 +114,6 @@ class InitResult:
 
 async def default_runner(name: str, args: list[str]) -> bool:
     """Default external tool runner — runs subprocess commands."""
-    import asyncio
 
     cmd_map = {
         "hindsight": ["hindsight", *args],
@@ -150,9 +177,11 @@ async def init_project(
     db_path = state_dir / "state.db"
     if db_path.exists():
         result.db_status = "exists"
+        _alembic_upgrade(db_path)
     else:
         async with Database(db_path):
             pass
+        _alembic_stamp(db_path)
         result.db_status = "created"
     _emit("db", result.db_status)
 
@@ -224,7 +253,9 @@ async def init_project(
         repo = str(repo_root)
 
         result.serena_status = "skipped"
-        _emit("serena", "run 'serena project create .' then 'serena project index' to set up Serena")
+        _emit(
+            "serena", "run 'serena project create .' then 'serena project index' to set up Serena"
+        )
 
         await run_external("gitnexus", ["setup"])
         if await run_external("gitnexus", ["analyze", repo]):

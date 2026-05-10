@@ -13,10 +13,6 @@ export default {
     const proc = Bun.spawnSync(
       ["uv", "run", "orch", "pr", "update", args.ticket_id],
       {
-        env: {
-          ...process.env,
-          ORCH_DB_PATH: process.env.ORCH_DB_PATH ?? ".orchestra/state.db",
-        },
         cwd: context.directory,
       },
     );

@@ -27,11 +27,6 @@ export default {
         args.author,
       ],
       {
-        env: {
-          ...process.env,
-          ORCH_DB_PATH:
-            process.env.ORCH_DB_PATH ?? ".orchestra/state.db",
-        },
         cwd: context.directory,
       },
     );

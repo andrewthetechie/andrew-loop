@@ -15,11 +15,6 @@ export default {
   ) {
     const cmd = ["uv", "run", "orch", "status", "--json"];
     const proc = Bun.spawnSync(cmd, {
-      env: {
-        ...process.env,
-        ORCH_DB_PATH:
-          process.env.ORCH_DB_PATH ?? ".orchestra/state.db",
-      },
       cwd: context.directory,
     });
     if (proc.exitCode !== 0) {

@@ -2,20 +2,23 @@
 
 import asyncio
 import json
-
 import sys
 from pathlib import Path
 
 import click
 import yaml
+from click.shell_completion import get_completion_class
 from rich.console import Console
 from rich.table import Table
 
 from orch.db import VALID_STATES, Database
+from orch.decompose import run_decompose
 from orch.doctor import run_doctor
 from orch.init import default_runner, init_project
+from orch.metrics import get_issue_breakdown, list_issue_totals
 from orch.pr import create_pr, update_pr
 from orch.router import Router
+from orch.state import read_active_issue
 from orch.tickets import (
     add_comment,
     add_dependencies,
@@ -52,6 +55,7 @@ acceptance_criteria: |
 file_paths: null
 test_expectations: null
 risk_score: null
+issue_id: null
 """
 
 
@@ -70,6 +74,11 @@ def _strip_yaml_comments(content: str) -> str:
     lines = content.splitlines()
     filtered = [line for line in lines if not line.lstrip().startswith("#")]
     return "\n".join(filtered)
+
+
+def _completion_var(prog_name: str) -> str:
+    """Build the environment variable Click uses for shell completion."""
+    return f"_{prog_name.replace('-', '_').upper()}_COMPLETE"
 
 
 @click.group()
@@ -97,6 +106,24 @@ def main(ctx: click.Context, db_path: str | None) -> None:
 
 
 @main.command()
+@click.argument("shell", type=click.Choice(["bash", "zsh"], case_sensitive=False))
+@click.pass_context
+def completion(ctx: click.Context, shell: str) -> None:
+    """Print a shell completion script."""
+    root_ctx = ctx.find_root()
+    prog_name = root_ctx.info_name or "orch"
+    completion_class = get_completion_class(shell)
+    click.echo(
+        completion_class(
+            root_ctx.command,
+            {},
+            prog_name,
+            _completion_var(prog_name),
+        ).source()
+    )
+
+
+@main.command()
 @click.option("--dir", "target_dir", default=".", help="Target repository directory.")
 @click.option("--no-externals", is_flag=True, help="Skip external tool setup.")
 def init(target_dir: str, no_externals: bool) -> None:
@@ -119,8 +146,10 @@ def init(target_dir: str, no_externals: bool) -> None:
 
         async def _prompt_bank_id(failed_bank_id: str) -> str | None:
             console.print(
-                f"\n  [yellow]Could not reach Hindsight — bank '{failed_bank_id}' was not created.[/yellow]"
-                "\n  Enter an existing bank name to use, or leave blank to skip."
+                f"\n  [yellow]Could not reach Hindsight"
+                f" — bank '{failed_bank_id}' was not created.[/yellow]"
+                "\n  Enter an existing bank name to use,"
+                " or leave blank to skip."
             )
             try:
                 new_id = click.prompt("  bank_id", default="", show_default=False)
@@ -128,7 +157,7 @@ def init(target_dir: str, no_externals: bool) -> None:
             except click.Abort:
                 return None
 
-        result = await init_project(
+        await init_project(
             repo_root,
             run_external=runner,
             on_step=_print_step,
@@ -166,10 +195,15 @@ def tickets(ctx: click.Context) -> None:
 @tickets.command()
 @click.option("--from-file", "from_file", type=click.Path(exists=True), help="YAML ticket file.")
 @click.option("--title", help="Ticket title (for quick creation).")
+@click.option("--issue-id", "issue_id", type=int, help="GitHub issue ID this ticket tracks.")
 @click.option("--depends-on", "depends_on", multiple=True, help="Ticket ID this depends on.")
 @click.pass_context
 def create(
-    ctx: click.Context, from_file: str | None, title: str | None, depends_on: tuple[str, ...]
+    ctx: click.Context,
+    from_file: str | None,
+    title: str | None,
+    issue_id: int | None,
+    depends_on: tuple[str, ...],
 ) -> None:
     """Create a new ticket."""
     strict = True
@@ -193,10 +227,18 @@ def create(
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
 
+    # --issue-id flag overrides anything in the YAML
+    if issue_id is not None:
+        data["issue_id"] = issue_id
+
     async def _create() -> None:
         db_path = ctx.obj["db_path"]
         async with Database(Path(db_path)) as db:
-            ticket = await create_ticket(db, data)
+            try:
+                ticket = await create_ticket(db, data)
+            except ValueError as e:
+                click.echo(f"Error: {e}", err=True)
+                sys.exit(1)
             if depends_on:
                 try:
                     await add_dependencies(db, ticket.id, list(depends_on))
@@ -233,6 +275,7 @@ def list_cmd(ctx: click.Context, state_filter: str | None, as_json: bool) -> Non
             table.add_column("Title")
             table.add_column("State")
             table.add_column("Risk")
+            table.add_column("Issue")
             table.add_column("PR")
             for t in items:
                 table.add_row(
@@ -240,6 +283,7 @@ def list_cmd(ctx: click.Context, state_filter: str | None, as_json: bool) -> Non
                     t.title,
                     t.state,
                     str(t.risk_score) if t.risk_score else "-",
+                    str(t.issue_id) if t.issue_id is not None else "-",
                     t.linked_pr or "-",
                 )
             console.print(table)
@@ -282,6 +326,8 @@ def show(ctx: click.Context, ticket_id: str, as_json: bool, as_yaml: bool) -> No
             console.print(f"[bold]{data['id']}[/bold]: {data['title']}")
             console.print(f"State: {data['state']}")
             console.print(f"Risk: {data['risk_score'] or '-'}")
+            if data["issue_id"] is not None:
+                console.print(f"Issue ID: {data['issue_id']}")
             console.print(f"PR: {data['linked_pr'] or '-'}")
             if deps:
                 console.print(f"Depends on: {', '.join(deps)}")
@@ -334,7 +380,6 @@ def reset_cmd(ctx: click.Context, ticket_id: str, yes: bool) -> None:
     history that would confuse the next agent run.
     """
     import shutil
-    import subprocess
 
     async def _reset() -> None:
         db_path = ctx.obj["db_path"]
@@ -356,37 +401,61 @@ def reset_cmd(ctx: click.Context, ticket_id: str, yes: bool) -> None:
             # Delete git worktree
             if ticket.worktree_path:
                 wt = Path(ticket.worktree_path)
-                if wt.is_dir():
-                    result = subprocess.run(
-                        ["git", "worktree", "remove", "--force", str(wt)],
-                        capture_output=True, cwd=str(repo_root),
+                if wt.exists():  # noqa: ASYNC240
+                    proc = await asyncio.create_subprocess_exec(
+                        "git",
+                        "worktree",
+                        "remove",
+                        "--force",
+                        str(wt),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=str(repo_root),
                     )
-                    if result.returncode != 0:
+                    await proc.wait()
+                    if proc.returncode != 0:
                         # Fallback: remove directory and prune
                         shutil.rmtree(wt, ignore_errors=True)
-                        subprocess.run(["git", "worktree", "prune"], cwd=str(repo_root))
+                        prune = await asyncio.create_subprocess_exec(
+                            "git",
+                            "worktree",
+                            "prune",
+                            cwd=str(repo_root),
+                        )
+                        await prune.wait()
                     console.print(f"  [dim]deleted worktree {wt}[/dim]")
 
             # Delete git branch
             branch = f"ticket/{ticket_id}"
-            result = subprocess.run(
-                ["git", "branch", "-D", branch],
-                capture_output=True, cwd=str(repo_root),
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "branch",
+                "-D",
+                branch,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(repo_root),
             )
-            if result.returncode == 0:
+            await proc.wait()
+            if proc.returncode == 0:
                 console.print(f"  [dim]deleted branch {branch}[/dim]")
 
             # Clear all comments
             from sqlalchemy import delete as sa_delete
+
             from orch.db import TicketComment
+
             async with db.session() as session:
-                await session.execute(sa_delete(TicketComment).where(TicketComment.ticket_id == ticket_id))
+                await session.execute(
+                    sa_delete(TicketComment).where(TicketComment.ticket_id == ticket_id)
+                )
                 await session.commit()
-            console.print(f"  [dim]cleared comments[/dim]")
+            console.print("  [dim]cleared comments[/dim]")
 
             # Reset ticket fields
             await update_ticket(
-                db, ticket_id,
+                db,
+                ticket_id,
                 state="To Do",
                 linked_pr=None,
                 worktree_path=None,
@@ -422,7 +491,9 @@ def move(ctx: click.Context, ticket_id: str, new_state: str) -> None:
 @click.option("--state", help="New state.")
 @click.option("--linked-pr", help="PR URL.")
 @click.option("--assignee", help="Assignee.")
-@click.option("--reset-rework", "reset_rework", is_flag=True, help="Reset the rework loop count to 0.")
+@click.option(
+    "--reset-rework", "reset_rework", is_flag=True, help="Reset the rework loop count to 0."
+)
 @click.pass_context
 def update(
     ctx: click.Context,
@@ -597,9 +668,9 @@ def human_review_cmd(ctx: click.Context) -> None:
                 # Show last router comment relevant to this state
                 escalation = next(
                     (
-                        c for c in reversed(comments)
-                        if c.author == "router"
-                        and any(s in c.body for s in _HUMAN_STATES)
+                        c
+                        for c in reversed(comments)
+                        if c.author == "router" and any(s in c.body for s in _HUMAN_STATES)
                     ),
                     None,
                 )
@@ -607,9 +678,7 @@ def human_review_cmd(ctx: click.Context) -> None:
                     console.print(escalation.body)
 
                 # Show last non-router comment (review findings, merger decision, etc.)
-                review = next(
-                    (c for c in reversed(comments) if c.author not in ("router",)), None
-                )
+                review = next((c for c in reversed(comments) if c.author not in ("router",)), None)
                 if review and review != escalation:
                     console.rule(f"[dim]Last comment from {review.author}[/dim]", style="dim")
                     console.print(review.body)
@@ -617,7 +686,6 @@ def human_review_cmd(ctx: click.Context) -> None:
                 console.print()
 
     _run(_review())
-
 
 
 @main.command("validate")
@@ -655,13 +723,15 @@ def validate_cmd(target_dir: str, as_json: bool) -> None:
             cwd=str(repo_root),
         )
         passed = proc.returncode == 0
-        results.append({
-            "command": cmd,
-            "exit_code": proc.returncode,
-            "passed": passed,
-            "stdout": proc.stdout.strip(),
-            "stderr": proc.stderr.strip(),
-        })
+        results.append(
+            {
+                "command": cmd,
+                "exit_code": proc.returncode,
+                "passed": passed,
+                "stdout": proc.stdout.strip(),
+                "stderr": proc.stderr.strip(),
+            }
+        )
 
     all_passed = all(r["passed"] for r in results)
 
@@ -679,6 +749,7 @@ def validate_cmd(target_dir: str, as_json: bool) -> None:
 
     if not all_passed:
         raise SystemExit(1)
+
 
 @main.command("status")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
@@ -722,6 +793,104 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
             console.print(table)
 
     _run(_status())
+
+
+@main.command("decompose")
+@click.argument("prd_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--issue", "issue_id", type=int, help="Overwrite an existing GitHub issue.")
+@click.option(
+    "--no-active",
+    is_flag=True,
+    help="Run decomposition without writing active_issue to state config.",
+)
+def decompose_cmd(prd_path: Path, issue_id: int | None, no_active: bool) -> None:
+    """Create/update a PRD issue, prepare its branch, and dispatch the decomposer."""
+    import click as _click
+
+    repo_root = Path.cwd()
+
+    def _confirm(target_issue: int) -> bool:
+        return _click.confirm(f"Overwrite GitHub issue #{target_issue} with this PRD?")
+
+    def _warn(message: str) -> None:
+        click.echo(f"Warning: {message}")
+
+    def _info(message: str) -> None:
+        click.echo(message)
+
+    try:
+        created_issue = run_decompose(
+            repo_root,
+            prd_path,
+            issue_id=issue_id,
+            no_active=no_active,
+            confirm_overwrite=_confirm,
+            warn=_warn,
+            info=_info,
+        )
+    except (RuntimeError, ValueError) as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1) from e
+
+    click.echo(f"Dispatched decomposer for issue #{created_issue}")
+
+
+@main.command("metrics")
+@click.option("--issue", "issue_id", type=int, help="Show per-ticket breakdown for one issue.")
+@click.pass_context
+def metrics_cmd(ctx: click.Context, issue_id: int | None) -> None:
+    """Show token metrics by issue or for a single issue."""
+
+    async def _metrics() -> None:
+        db_path = ctx.obj["db_path"]
+        async with Database(Path(db_path)) as db:
+            if issue_id is not None:
+                issue_title, rows = await get_issue_breakdown(db, issue_id)
+                if not rows:
+                    click.echo("No metrics recorded.")
+                    return
+
+                total_tokens = sum(int(row["total_tokens"]) for row in rows)
+                table = Table(
+                    show_header=True,
+                    header_style="bold",
+                    title=f"Issue #{issue_id}: {issue_title or 'Unknown'}",
+                )
+                table.add_column("Ticket")
+                table.add_column("Agent")
+                table.add_column("Model")
+                table.add_column("Tokens", justify="right")
+                for row in rows:
+                    table.add_row(
+                        str(row["ticket_id"]),
+                        str(row["agent_type"]),
+                        str(row["model"]),
+                        f"{int(row['total_tokens']):,}",
+                    )
+                table.add_section()
+                table.add_row("", "", "Total", f"{total_tokens:,}")
+                console.print(table)
+                return
+
+            totals = await list_issue_totals(db)
+            if not totals:
+                click.echo("No metrics recorded.")
+                return
+
+            table = Table(show_header=True, header_style="bold", title="Token Metrics")
+            table.add_column("Issue")
+            table.add_column("Tickets")
+            table.add_column("Tokens")
+            for row in totals:
+                issue_label = f"#{row['issue_id']}" if row["issue_id"] is not None else "None"
+                table.add_row(
+                    issue_label,
+                    str(row["ticket_count"]),
+                    f"{int(row['total_tokens']):,}",
+                )
+            console.print(table)
+
+    _run(_metrics())
 
 
 @main.command("log")
@@ -791,9 +960,14 @@ def pr(ctx: click.Context) -> None:
 
 @pr.command("create")
 @click.argument("ticket_id")
-@click.option("--base", "base_branch", default="main", help="Base branch for the PR.")
+@click.option(
+    "--base",
+    "base_branch",
+    default=None,
+    help="Base branch for the PR. Auto-resolved from ticket issue_id if omitted.",
+)
 @click.pass_context
-def pr_create(ctx: click.Context, ticket_id: str, base_branch: str) -> None:
+def pr_create(ctx: click.Context, ticket_id: str, base_branch: str | None) -> None:
     """Create a PR for a ticket."""
 
     async def _pr_create() -> None:
@@ -837,10 +1011,36 @@ def router(ctx: click.Context) -> None:
 @router.command()
 @click.option("--interval", default=10.0, type=float, help="Poll interval in seconds.")
 @click.option("--verbose", "-v", is_flag=True, help="Stream raw worker JSON to the terminal.")
-@click.option("--tui", "-t", is_flag=True, help="Show split-pane TUI with live status and parsed log.")
-@click.option("--manual-approval", "-m", is_flag=True, help="Pause before each dispatch and ask for confirmation.")
+@click.option("--no-tui", is_flag=True, help="Disable the split-pane TUI.")
+@click.option(
+    "--manual-approval",
+    "-m",
+    is_flag=True,
+    help="Pause before each dispatch and ask for confirmation.",
+)
+@click.option(
+    "--issue",
+    "issue_id",
+    type=int,
+    default=None,
+    help="GitHub issue number. Validates origin/issue-{N} exists before polling.",
+)
+@click.option(
+    "--all-issues",
+    "all_issues",
+    is_flag=True,
+    help="Work all issues in ascending order, completing each before moving on.",
+)
 @click.pass_context
-def start(ctx: click.Context, interval: float, verbose: bool, tui: bool, manual_approval: bool) -> None:
+def start(
+    ctx: click.Context,
+    interval: float,
+    verbose: bool,
+    no_tui: bool,
+    manual_approval: bool,
+    issue_id: int | None,
+    all_issues: bool,
+) -> None:
     """Start the router polling loop."""
     import signal
 
@@ -848,8 +1048,21 @@ def start(ctx: click.Context, interval: float, verbose: bool, tui: bool, manual_
     from orch.tui import RouterTUI
 
     async def _start() -> None:
+        nonlocal issue_id
         db_path = ctx.obj["db_path"]
         repo_root = Path.cwd()
+
+        # Resolve issue_id from active_issue when neither --issue nor --all-issues given
+        if issue_id is None and not all_issues:
+            active = read_active_issue(repo_root)
+            if active is not None and click.confirm(f"Work issue #{active}?", default=True):
+                issue_id = active
+            elif active is None:
+                entered = click.prompt(
+                    "No active issue. Enter issue number (or 0 to skip)", type=int, default=0
+                )
+                if entered > 0:
+                    issue_id = entered
 
         # Load config and initialise Hindsight client if configured
         cfg = Config.load(repo_root=repo_root)
@@ -858,6 +1071,7 @@ def start(ctx: click.Context, interval: float, verbose: bool, tui: bool, manual_
         if cfg.hindsight.url and cfg.hindsight.bank_id:
             try:
                 from hindsight_client import Hindsight
+
                 hindsight_client = Hindsight(
                     base_url=cfg.hindsight.url,
                     api_key=cfg.hindsight.api_key or None,
@@ -868,13 +1082,18 @@ def start(ctx: click.Context, interval: float, verbose: bool, tui: bool, manual_
                     f"[dim]Hindsight: {cfg.hindsight.url}  bank={hindsight_bank_id}[/dim]"
                 )
             except Exception as exc:
-                console.print(f"[yellow]Hindsight unavailable ({exc}) — retention disabled[/yellow]")
+                console.print(
+                    f"[yellow]Hindsight unavailable ({exc}) — retention disabled[/yellow]"
+                )
 
         async with Database(Path(db_path)) as db:
-            router_tui = RouterTUI(console=console) if tui else None
+            router_tui = None if no_tui else RouterTUI(console=console)
             r = Router(
-                db, repo_root,
+                db,
+                repo_root,
                 poll_interval=interval,
+                issue_id=issue_id,
+                all_issues=all_issues,
                 verbose=verbose,
                 manual_approval=manual_approval,
                 console=console,
@@ -882,6 +1101,8 @@ def start(ctx: click.Context, interval: float, verbose: bool, tui: bool, manual_
                 hindsight_client=hindsight_client,
                 hindsight_bank_id=hindsight_bank_id,
             )
+
+            await r.validate_feature_branch()
 
             try:
                 loop = asyncio.get_event_loop()

@@ -35,11 +35,6 @@ export default {
       return "No updates requested. Provide at least one of: state, linked_pr, assignee.";
     }
     const proc = Bun.spawnSync(cmd, {
-      env: {
-        ...process.env,
-        ORCH_DB_PATH:
-          process.env.ORCH_DB_PATH ?? ".orchestra/state.db",
-      },
       cwd: context.directory,
     });
     if (proc.exitCode !== 0) {

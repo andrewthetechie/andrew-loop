@@ -12,11 +12,32 @@ from orch.tickets import get_ticket
 logger = logging.getLogger(__name__)
 
 _MENTAL_MODELS = [
-    ("codebase-conventions", "Codebase Conventions", "What are the coding conventions, patterns, and standards used in this codebase?"),
-    ("common-review-findings", "Common Review Findings", "What are the most common code review findings and recurring issues in this codebase?"),
-    ("validation-patterns", "Validation Patterns", "What validation patterns, test strategies, and verification approaches are used?"),
-    ("security-patterns", "Security Patterns", "What security patterns, threat mitigations, and sensitive areas exist in this codebase?"),
-    ("lessons-learned", "Lessons Learned", "What lessons have been learned from completed tickets, failures, and human interventions?"),
+    (
+        "codebase-conventions",
+        "Codebase Conventions",
+        "What are the coding conventions, patterns, and standards used in this codebase?",
+    ),
+    (
+        "common-review-findings",
+        "Common Review Findings",
+        "What are the most common code review findings and recurring issues in this codebase?",
+    ),
+    (
+        "validation-patterns",
+        "Validation Patterns",
+        "What validation patterns, test strategies, and verification approaches are used?",
+    ),
+    (
+        "security-patterns",
+        "Security Patterns",
+        "What security patterns, threat mitigations, and sensitive areas exist in this codebase?",
+    ),
+    (
+        "lessons-learned",
+        "Lessons Learned",
+        "What lessons have been learned from completed tickets,"
+        " failures, and human interventions?",
+    ),
 ]
 
 
@@ -62,7 +83,9 @@ async def setup_hindsight(url: str, bank_id: str, api_key: str) -> HindsightSetu
             )
             result.bank_status = "created"
         except Exception as exc:
-            logger.debug("acreate_bank failed for %s: %s — checking if bank already exists", bank_id, exc)
+            logger.debug(
+                "acreate_bank failed for %s: %s — checking if bank already exists", bank_id, exc
+            )
             # acreate_bank failed — check if the bank already exists and is usable
             try:
                 await client.banks.get_bank_profile(bank_id)
@@ -80,7 +103,9 @@ async def setup_hindsight(url: str, bank_id: str, api_key: str) -> HindsightSetu
             logger.debug("Failed to list mental models for bank %s: %s", bank_id, exc)
             existing_ids = set()
 
-        trigger = mental_model_trigger_input.MentalModelTriggerInput(refresh_after_consolidation=True)
+        trigger = mental_model_trigger_input.MentalModelTriggerInput(
+            refresh_after_consolidation=True
+        )
 
         for model_id, name, source_query in _MENTAL_MODELS:
             if model_id in existing_ids:

@@ -70,6 +70,10 @@ class StateConfig(BaseModel):
     base_dir: str = "~/.local/share/orch"
 
 
+class GithubConfig(BaseModel):
+    prd_labels: list[str] = []
+
+
 class Config(BaseModel):
     webhook: WebhookConfig = WebhookConfig()
     harness: HarnessConfig = HarnessConfig()
@@ -79,6 +83,7 @@ class Config(BaseModel):
     mcp: McpConfig = McpConfig()
     agents: AgentsConfig = AgentsConfig()
     state: StateConfig = StateConfig()
+    github: GithubConfig = GithubConfig()
 
     @classmethod
     def load(
@@ -88,7 +93,14 @@ class Config(BaseModel):
         global_config_path: Path | None = None,
         overrides: dict[str, Any] | None = None,
     ) -> Config:
-        """Load config with three-tier precedence: overrides > repo > global > defaults."""
+        """Load config with three-tier precedence: overrides > state_dir > global > defaults.
+
+        Config is loaded from (in ascending priority):
+          1. Defaults
+          2. ~/.config/orchestra/config.toml  (global)
+          3. ~/.local/share/orch/{repo_id}/config.toml  (state dir, repo-specific)
+          4. Explicit overrides
+        """
         merged: dict[str, Any] = {}
 
         # Load global config
@@ -97,11 +109,24 @@ class Config(BaseModel):
         global_data = _load_toml(global_config_path)
         _deep_merge(merged, global_data)
 
-        # Load repo config
+        # Load state-dir config (repo-specific, replaces old .orchestra/config.toml)
         if repo_root is not None:
-            repo_path = repo_root / ".orchestra" / "config.toml"
-            repo_data = _load_toml(repo_path)
-            _deep_merge(merged, repo_data)
+            # Try new state dir location first
+            try:
+                from orch.state import resolve_state_dir
+
+                # Read base_dir from merged so far (in case global config overrides it)
+                base_dir = merged.get("state", {}).get("base_dir")
+                state_dir = resolve_state_dir(repo_root, base_dir=base_dir)
+                state_config = _load_toml(state_dir / "config.toml")
+                _deep_merge(merged, state_config)
+            except Exception:
+                pass
+
+            # Backward compat: also load from old .orchestra/config.toml if it exists
+            old_path = repo_root / ".orchestra" / "config.toml"
+            if old_path.is_file():
+                _deep_merge(merged, _load_toml(old_path))
 
         # Apply explicit overrides
         if overrides:

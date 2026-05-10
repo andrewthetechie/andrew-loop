@@ -51,6 +51,7 @@ class Ticket(Base):
     rework_loop_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     linked_pr: Mapped[str | None] = mapped_column(Text)
     worktree_path: Mapped[str | None] = mapped_column(Text)
+    issue_id: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[str] = mapped_column(Text, nullable=False)
 
@@ -99,6 +100,17 @@ class TicketDependency(Base):
     depends_on_ticket_id: Mapped[str] = mapped_column(
         Text, ForeignKey("tickets.id"), primary_key=True
     )
+
+
+class TicketMetrics(Base):
+    __tablename__ = "ticket_metrics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[str] = mapped_column(Text, ForeignKey("tickets.id"), nullable=False)
+    agent_type: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    dispatched_at: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 @event.listens_for(Engine, "connect")

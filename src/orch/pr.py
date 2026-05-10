@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from orch.db import Database
+from orch.router import feature_branch_name
 from orch.tickets import get_ticket, update_ticket
 
 RunCmd = Callable[[list[str], Path | None], Awaitable[tuple[int, str, str]]]
@@ -35,16 +36,23 @@ async def create_pr(
     db: Database,
     ticket_id: str,
     *,
-    base_branch: str = "main",
+    base_branch: str | None = None,
     run_cmd: RunCmd | None = None,
     cwd: Path | None = None,
 ) -> str:
-    """Create a PR for a ticket using gh CLI. Returns the PR URL."""
+    """Create a PR for a ticket using gh CLI. Returns the PR URL.
+
+    When base_branch is not specified, it is derived from the ticket's issue_id:
+    issue-{N} if set, 'main' otherwise.
+    """
     run = run_cmd or _default_run_cmd
     ticket = await get_ticket(db, ticket_id)
     if ticket is None:
         msg = f"Ticket '{ticket_id}' not found."
         raise ValueError(msg)
+
+    if base_branch is None:
+        base_branch = feature_branch_name(ticket.issue_id)
 
     title = f"ticket/{ticket_id}: {ticket.title}"
     body = (

@@ -17,6 +17,7 @@ YAML_FIELDS = (
     "file_paths",
     "test_expectations",
     "risk_score",
+    "issue_id",
 )
 
 REQUIRED_FIELDS = ("title", "description", "acceptance_criteria")
@@ -86,6 +87,7 @@ def ticket_to_dict(ticket: Ticket, comments: list[TicketComment] | None = None) 
         "rework_loop_count": ticket.rework_loop_count,
         "linked_pr": ticket.linked_pr,
         "worktree_path": ticket.worktree_path,
+        "issue_id": ticket.issue_id,
         "created_at": ticket.created_at,
         "updated_at": ticket.updated_at,
     }
@@ -189,6 +191,11 @@ async def promote_tickets(db: Database, *, ticket_id: str | None = None) -> list
 
 async def create_ticket(db: Database, data: dict) -> Ticket:
     """Create a new ticket in Draft state."""
+    issue_id = data.get("issue_id")
+    if issue_id is not None and not isinstance(issue_id, int):
+        msg = "issue_id must be an integer when provided."
+        raise ValueError(msg)
+
     async with db.session() as session:
         existing = await _get_all_ticket_ids(session)
         ticket_id = _next_ticket_id(existing)
@@ -204,6 +211,7 @@ async def create_ticket(db: Database, data: dict) -> Ticket:
             state="Draft",
             risk_score=data.get("risk_score"),
             rework_loop_count=0,
+            issue_id=issue_id,
             created_at=now,
             updated_at=now,
         )
@@ -457,18 +465,25 @@ async def _load_dependency_graph(session: object) -> dict[str, set[str]]:
     return graph
 
 
-async def get_next_routable(db: Database, *, states: tuple[str, ...] = ("To Do",)) -> str | None:
+async def get_next_routable(
+    db: Database,
+    *,
+    states: tuple[str, ...] = ("To Do",),
+    issue_id: int | None = None,
+) -> str | None:
     """Find the next routable ticket, respecting dependencies and priority.
 
     A ticket is routable when it's in one of the given states and all its
     dependencies are 'Done'.
+    When *issue_id* is set, only tickets with that issue_id are considered.
     Priority: most transitive dependents first (unblocks the most work), FIFO tiebreaker.
     """
     async with db.session() as session:
         # Get tickets in routable states
-        result = await session.execute(
-            select(Ticket).where(Ticket.state.in_(states)).order_by(Ticket.created_at)
-        )
+        query = select(Ticket).where(Ticket.state.in_(states))
+        if issue_id is not None:
+            query = query.where(Ticket.issue_id == issue_id)
+        result = await session.execute(query.order_by(Ticket.created_at))
         routable_candidates = list(result.scalars().all())
 
         if not routable_candidates:
@@ -517,3 +532,20 @@ async def get_next_routable(db: Database, *, states: tuple[str, ...] = ("To Do",
         routable.sort(key=lambda t: _transitive_dependents_count(t.id), reverse=True)
 
         return routable[0].id
+
+
+async def get_routable_issue_ids(
+    db: Database, *, states: tuple[str, ...] = ("To Do",)
+) -> list[int]:
+    """Return distinct issue_id values from tickets in routable states, sorted ascending.
+
+    Tickets with NULL issue_id are excluded.
+    """
+    async with db.session() as session:
+        result = await session.execute(
+            select(Ticket.issue_id)
+            .where(Ticket.state.in_(states), Ticket.issue_id.isnot(None))
+            .distinct()
+            .order_by(Ticket.issue_id)
+        )
+        return [row[0] for row in result.all()]

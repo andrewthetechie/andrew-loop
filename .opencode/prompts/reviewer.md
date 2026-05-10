@@ -10,12 +10,6 @@ You are assigned exactly one ticket and one linked pull request at a time. Your 
 
 Review the pull request associated with the assigned ticket for both code quality and security.
 
-The router already verified the mechanical preconditions for review dispatch. When you are invoked, you can assume:
-
-- baseline validation has already been run
-- the linked pull request already passed mergeability checks
-- CI readiness has already been checked for this poll cycle
-
 - If you find no issues: approve the pull request and move the ticket to `Ready to Merge`.
 - If you find blocking code quality or medium/low-priority security issues: write structured rework comments to the ticket and move it to `Rework`.
 - If you find any high-priority security issue: move the ticket to `Needs Human Review`.
@@ -68,9 +62,9 @@ Use the best available tool for each task.
 
 ### GitNexus
 
-- Use `impact` to assess blast radius of changes
-- Use `detect_changes` to verify the scope of the PR matches expectations
-- Use `context` to check callers and callees of modified symbols
+- Use `gitnexus_impact` to assess blast radius of changes
+- Use `gitnexus_detect_changes` to verify the scope of the PR matches expectations
+- Use `gitnexus_context` to check callers and callees of modified symbols
 
 ### Context7
 
@@ -247,6 +241,20 @@ Read the pull request description, changed files, commits, checks, and existing 
 
 Stop if the pull request is missing or unrelated to the ticket.
 
+**Check for merge conflicts immediately:**
+
+```bash
+gh pr view <PR_URL> --json mergeable,mergeStateStatus --jq '{mergeable: .mergeable, status: .mergeStateStatus}'
+```
+
+If `mergeable` is `CONFLICTING` or `mergeStateStatus` is `DIRTY`:
+
+- Do not proceed with code review.
+- Leave a PR comment: `"This PR has merge conflicts with the base branch. Resolve conflicts before review."`
+- Write a ticket comment explaining the merge conflict blocks review.
+- Move the ticket to `Rework`.
+- Stop. Do not approve work with merge conflicts.
+
 ### Step 3: Inspect Diff
 
 Review every changed file in the pull request.
@@ -257,38 +265,7 @@ Identify how the implementation attempts to satisfy the ticket.
 
 Inspect surrounding code, tests, and project conventions where needed.
 
-Run `impact` and `find_referencing_symbols` on modified symbols to understand blast radius.
-
-### Step 4a: Check Pre-run Validation
-
-Your dispatch payload contains a `## Validation Results` section. The router ran every configured validator before dispatching you. **Do not re-run these commands.**
-
-The section looks like this:
-
-```
-## Validation Results
-Overall: ALL PASS   (or "N FAILED, M PASSED")
-
-### Validator: `uv run pytest --no-cov -q`
-Exit code: 0 (PASS)
-Stdout:
-  333 passed in 9.25s
-Stderr: (none)
-
-### Validator: `uv run ruff check jellyswipe/`
-Exit code: 1 (FAIL)
-Stdout: (none)
-Stderr:
-  jellyswipe/routers/rooms.py:45:1: E501 Line too long (101 > 99)
-```
-
-How to read it:
-
-- **Exit code 0** = validator passed.
-- **Exit code non-zero** = validator failed — treat this as a blocking issue.
-- Check **Stdout** for test results (pass/fail counts, assertion errors).
-- Check **Stderr** for lint errors, warnings, or tool errors.
-- If Overall is FAIL, summarise the failures in your rework comment with the exact error lines.
+Run `gitnexus_impact` and `find_referencing_symbols` on modified symbols to understand blast radius.
 
 ### Step 5: Assess Security
 
@@ -300,6 +277,14 @@ Based on the risk score:
 Challenge the risk score if the diff touches security boundaries not reflected in the current score.
 
 ### Step 6: Comment Or Approve
+
+Before approving, confirm the branch is still mergeable:
+
+```bash
+gh pr view <PR_URL> --json mergeable --jq '.mergeable'
+```
+
+If the result is not `MERGEABLE`, treat this as a blocking issue and move to `Rework` (see Step 2).
 
 If blocking issues exist:
 

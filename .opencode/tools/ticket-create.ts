@@ -16,6 +16,11 @@ export default {
       .max(5)
       .optional()
       .describe("Risk score 1-5 (1=low risk, 5=high risk/security sensitive)"),
+    issue_id: z
+      .number()
+      .int()
+      .optional()
+      .describe("GitHub issue ID this ticket should be linked to"),
     file_paths: z
       .string()
       .optional()
@@ -35,6 +40,7 @@ export default {
       description: string;
       acceptance_criteria: string;
       risk_score?: number;
+      issue_id?: number;
       file_paths?: string;
       test_expectations?: string;
       depends_on?: string[];
@@ -63,9 +69,11 @@ export default {
         "orch",
         "tickets",
         "create",
-        "--from-file",
-        tmpFile,
       ];
+      if (args.issue_id !== undefined) {
+        cmd.push("--issue-id", String(args.issue_id));
+      }
+      cmd.push("--from-file", tmpFile);
       if (args.depends_on?.length) {
         for (const dep of args.depends_on) {
           cmd.push("--depends-on", dep);
@@ -73,10 +81,6 @@ export default {
       }
 
       const proc = Bun.spawnSync(cmd, {
-        env: {
-          ...process.env,
-          ORCH_DB_PATH: process.env.ORCH_DB_PATH ?? ".orchestra/state.db",
-        },
         cwd: context.directory,
       });
 

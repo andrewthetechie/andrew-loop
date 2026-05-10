@@ -153,7 +153,7 @@ def merger_agent_config() -> AgentConfig:
         description="Verifies scope match and merges eligible pull requests",
         mode="primary",
         temperature=0.1,
-        steps=50,
+        steps=15,
         prompt_file="merger.md",
         permission={
             "read": "allow",
@@ -168,13 +168,8 @@ def merger_agent_config() -> AgentConfig:
             "ticket-read": "allow",
             "ticket-update": "allow",
             "ticket-comment": "allow",
-            "ticket-list": "allow",
             "pr-status": "allow",
             "pr-merge": "allow",
-            "serena_*": "allow",
-            "gitnexus_*": "allow",
-            "context7_*": "allow",
-            "hindsight_*": "allow",
         },
     )
 

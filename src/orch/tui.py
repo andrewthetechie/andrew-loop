@@ -4,15 +4,31 @@ from __future__ import annotations
 
 import json
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from rich.console import Console
+from rich.console import Console, ConsoleOptions, RenderResult
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+
+
+class _LiveRenderable:
+    """Wraps a zero-argument render function so Rich calls it fresh on every render pass.
+
+    Layout slots populated with this renderable will recompute their content on every
+    Rich Live auto-refresh frame (default 4Hz), so elapsed-time fields tick continuously
+    even when no agent events arrive.
+    """
+
+    def __init__(self, render_fn: Callable[[], Panel]) -> None:
+        self._render_fn = render_fn
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        yield from console.render(self._render_fn(), options)
 
 # Approximate context window limits by model name fragment (lowercase match)
 _CONTEXT_LIMITS: list[tuple[str, int]] = [
@@ -56,7 +72,7 @@ def _context_bar(used: int, total: int, width: int = _BAR_WIDTH) -> Text:
 
 
 class RouterTUI:
-    """Split-pane TUI: top 1/3 status (3 columns), bottom 2/3 scrolling log."""
+    """Split-pane TUI: top 1/3 status, bottom 2/3 split into log and agent stream."""
 
     MAX_LOG_LINES = 500
 
@@ -64,6 +80,7 @@ class RouterTUI:
         self._console = console or Console()
         self._live: Live | None = None
         self._log: deque[Text] = deque(maxlen=self.MAX_LOG_LINES)
+        self._agent_text: deque[Text] = deque(maxlen=self.MAX_LOG_LINES)
 
         # Ticket state
         self._ticket_id: str = "—"
@@ -82,7 +99,7 @@ class RouterTUI:
         # Agent state
         self._agent_type: str = "—"
         self._agent_model: str = "—"
-        self._context_used: int = 0       # input tokens in current step
+        self._context_used: int = 0  # input tokens in current step
         self._context_limit: int = _DEFAULT_CONTEXT_LIMIT
         self._step_budget: int = 50
         self._total_cost: float = 0.0
@@ -160,6 +177,7 @@ class RouterTUI:
         self._agent_type = "—"
         self._agent_model = "—"
         self._context_used = 0
+        self._agent_text.clear()
         self._stage_start = None
         self._dispatch_start = None
         self._refresh()
@@ -231,7 +249,8 @@ class RouterTUI:
                     self.set_stage(stage)
                     self.log(f"  [bold]{stripped}[/bold]")
                 else:
-                    self.log(f"  [italic]{stripped[:120]}[/italic]")
+                    self._agent_text.append(Text(stripped[:120], style="italic"))
+                    self._refresh()
 
         elif event_type == "tool_use":
             tool = part.get("tool", "?")
@@ -259,20 +278,35 @@ class RouterTUI:
         layout = Layout()
         layout.split_column(
             Layout(name="status", ratio=1),
-            Layout(name="log", ratio=2),
+            Layout(name="bottom", ratio=2),
         )
         layout["status"].split_row(
             Layout(name="ticket_info"),
             Layout(name="router_info"),
             Layout(name="agent_info"),
         )
+        layout["bottom"].split_row(
+            Layout(name="event_log"),
+            Layout(name="agent_stream"),
+        )
+        # Live renderables: Rich calls the render function fresh on every refresh frame
+        # so elapsed-time fields tick at 4Hz even when no agent events arrive.
+        layout["ticket_info"].update(_LiveRenderable(self._render_ticket_info))
+        layout["router_info"].update(_LiveRenderable(self._render_router_info))
+        layout["agent_info"].update(_LiveRenderable(self._render_agent_info))
+        layout["event_log"].update(_LiveRenderable(self._render_event_log))
+        layout["agent_stream"].update(_LiveRenderable(self._render_agent_stream))
         return layout
 
     def _refresh(self) -> None:
-        self._layout["ticket_info"].update(self._render_ticket_info())
-        self._layout["router_info"].update(self._render_router_info())
-        self._layout["agent_info"].update(self._render_agent_info())
-        self._layout["log"].update(self._render_log())
+        """Force an immediate Rich Live refresh.
+
+        State fields are updated by callers before this is called; the live renderables
+        will pick them up on the next render frame automatically. Explicit refresh
+        here gives <250ms latency for important events (dispatch, log lines, etc.).
+        """
+        if self._live:
+            self._live.refresh()
 
     def _render_ticket_info(self) -> Panel:
         t = Table.grid(padding=(0, 2))
@@ -311,9 +345,7 @@ class RouterTUI:
         t.add_row("Model", f"[dim]{model_display}[/dim]")
 
         # Step budget
-        step_str = (
-            f"{self._step}/{self._step_budget}" if self._step else f"—/{self._step_budget}"
-        )
+        step_str = f"{self._step}/{self._step_budget}" if self._step else f"—/{self._step_budget}"
         t.add_row("Steps", step_str)
 
         # Context bar
@@ -335,16 +367,31 @@ class RouterTUI:
 
         return Panel(t, title="[bold]Agent Info[/bold]", border_style="magenta")
 
-    def _render_log(self) -> Panel:
+    def _tail_lines(self, lines: deque[Text] | list[Text]) -> Text:
         term_height = self._console.height or 40
         log_height = max(5, (term_height * 2 // 3) - 4)
-        lines = list(self._log)[-log_height:]
         combined = Text()
-        for i, line in enumerate(lines):
+        for i, line in enumerate(list(lines)[-log_height:]):
             if i:
                 combined.append("\n")
             combined.append_text(line)
-        return Panel(combined, title="[bold]Log[/bold]", border_style="dim", padding=(0, 1))
+        return combined
+
+    def _render_event_log(self) -> Panel:
+        return Panel(
+            self._tail_lines(self._log),
+            title="[bold]Event Log[/bold]",
+            border_style="dim",
+            padding=(0, 1),
+        )
+
+    def _render_agent_stream(self) -> Panel:
+        return Panel(
+            self._tail_lines(self._agent_text),
+            title="[bold]Agent Stream[/bold]",
+            border_style="dim",
+            padding=(0, 1),
+        )
 
     @staticmethod
     def _elapsed(start: datetime | None) -> str:

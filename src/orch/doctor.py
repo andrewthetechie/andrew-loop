@@ -120,7 +120,8 @@ async def run_doctor(
     result = DoctorResult()
 
     from orch.config import Config
-    from orch.state import resolve_state_dir, repo_id_from_remote
+    from orch.state import repo_id_from_remote, resolve_state_dir
+
     cfg = Config.load(repo_root=repo_root)
     state_dir = resolve_state_dir(repo_root, base_dir=cfg.state.base_dir)
     repo_id = repo_id_from_remote(repo_root)
@@ -137,7 +138,7 @@ async def run_doctor(
     # Database check — verify schema, not just file existence
     db_path = state_dir / "state.db"
     if not db_path.is_file():
-        result.checks.append(CheckResult("database", False, ".orchestra/state.db not found"))
+        result.checks.append(CheckResult("database", False, f"state.db not found in {state_dir}"))
     else:
         result.checks.append(await _check_db_schema(db_path))
 
