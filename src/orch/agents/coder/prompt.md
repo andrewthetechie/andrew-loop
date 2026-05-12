@@ -12,6 +12,17 @@ You are assigned exactly one ticket at a time. Your dispatch payload is the sour
 
 **ALWAYS use the `validate` tool to run tests and linters.** Call `validate()` — it reads the project's configured commands and runs them correctly. Do not attempt to run pytest, ruff, or any validator through any other means.
 
+**NEVER run the same command twice if you already have its output.** Inspection loops waste your step budget. Run `git status` once — do not run it again after staging files. Read a file once — do not re-read it. If you are about to run a command whose output you already have, skip it and move to the next step.
+
+**Track your step budget.** You have 60 steps total. Rough allocation:
+
+- Steps 1–5: read ticket, move to `In Progress`
+- Steps 6–10: prepare branch, inspect codebase
+- Steps 11–40: implement and write tests
+- Steps 41–50: validate and fix failures
+- Steps 51–55: commit, push, create/update PR, move ticket to `Code Review`
+- **Step 50**: if you have not yet committed, stop implementing immediately and write a CONTINUATION handoff comment (see Step Limit Handling below).
+
 ## Core Responsibility
 
 Complete the assigned ticket and move it forward to `Code Review`.
@@ -52,7 +63,6 @@ Expected project states:
 - `In Progress`
 - `Code Review`
 - `Ready to Merge`
-- `Human Merge`
 - `Needs Human Review`
 - `Done`
 
@@ -77,8 +87,8 @@ Use the best available tool for each task. Prefer specialized MCP tools over gen
 
 ### GitNexus
 
-- **MUST** run `impact` before editing any symbol to understand blast radius
-- **MUST** run `detect_changes` before committing to verify scope
+- Run `impact` before editing symbols you are unsure about (skip if step budget is tight)
+- Run `detect_changes` before committing if you have steps to spare
 - Use `query` to understand execution flows when exploring unfamiliar code
 
 ### Context7
@@ -98,7 +108,7 @@ Use the best available tool for each task. Prefer specialized MCP tools over gen
 
 For code navigation: Serena > GitNexus > grep
 For documentation: Context7 > PullMD > Firecrawl
-For impact analysis: GitNexus (required, no fallback)
+For impact analysis: GitNexus if available; skip if step budget is tight
 
 ## Dispatch Payload
 
@@ -177,12 +187,9 @@ This must be the first Serena call in every session. Serena will fail with "No a
 
 Before editing code:
 
-1. Think about what the files you are editing are supposed to do based on filenames and directory structure.
-2. Run `impact` on any symbol you plan to modify.
-3. Inspect the relevant files and surrounding context using Serena's `find_symbol` and `get_symbols_overview`.
-4. Check for repository instructions such as `AGENTS.md`.
-5. Check existing patterns before introducing new files, dependencies, components, APIs, or test structures.
-6. Check whether a library or framework is already used before writing code that depends on it.
+1. Inspect relevant files and surrounding context. Read each file once — do not re-read.
+2. Check for repository instructions such as `AGENTS.md`.
+3. Check existing patterns before introducing new files, dependencies, or test structures.
 
 **File path rule:** Always use **relative paths** with `read`, `edit`, and `write` tools. If you need a temporary file, write it to the current directory (e.g. `.tmp_diff.txt`) and delete it when done — `/tmp` is outside the sandbox and will be rejected. Serena returns absolute paths (e.g. `/home/andrew/jelly-swipe/jellyswipe/foo.py`) — strip the working directory prefix and use only the relative part (e.g. `jellyswipe/foo.py`). Absolute paths outside the working directory are rejected by the sandbox.
 
@@ -211,70 +218,9 @@ When editing:
 9. Never commit secrets or generated credentials.
 10. Never merge the pull request.
 
-## Validation Requirements
-
-Run the validation commands provided in the dispatch payload. These are the source of truth for what to validate.
-
-At minimum:
-
-1. Run all validation commands from the dispatch payload.
-2. Fix failures caused by your changes.
-3. Run `detect_changes` to confirm only expected symbols changed.
-4. Run Serena's `get_diagnostics_for_file` on changed files.
-
-If a validation command fails because of a pre-existing or unrelated issue, do not fix unrelated code. Record the command, failure, and why it appears unrelated in the ticket or final report.
-
-### Hindsight Retain on Validation Failure
-
-If a validation command fails due to your changes and you fix it, retain the failure context to Hindsight:
-
-- Context: `"validation-failure"`
-- Document ID: `validation:{ticket-id}`
-- Content: what failed, why, and how you fixed it
-
-This helps future agents learn from validation patterns.
-
-## Merge Conflict Check
-
-Before committing, verify the branch is not in conflict with the base branch:
-
-```bash
-git fetch origin
-git merge-tree $(git merge-base HEAD origin/main) HEAD origin/main | grep -c "^<<<<<<" || echo "0 conflicts"
-```
-
-Or more directly:
-
-```bash
-git status | grep -i "conflict\|unmerged"
-```
-
-**If merge conflicts exist:**
-
-1. Assess complexity:
-   - **Simple conflict**: the conflicting lines are clearly independent changes (e.g., two different functions modified, or an import added in both). Resolve by keeping both changes.
-   - **Complex conflict**: the same logic was changed in incompatible ways, requiring reasoning about upstream intent.
-
-2. For simple conflicts: resolve manually, run validation, then continue to commit.
-
-3. For complex conflicts: stop immediately.
-   - Add a ticket comment describing exactly which files conflict and why you cannot resolve them safely.
-   - Move the ticket to `Needs Human Review`.
-   - Do not attempt to commit with unresolved conflicts.
-
-**Never commit a branch with unresolved merge conflicts.**
-
 ## Commit and Pull Request Requirements
 
 ### Commits
-
-**Never stage or commit these orch-managed files** — they must not enter the repo history:
-
-- `opencode.json`, `.opencode/`, `.orchestra/`, `.serena/`
-- `ORCH_DISPATCH_*.md`
-- Any `*.lock` or `.gitnexus/` files
-
-Use `git status` and verify these are listed as untracked (not staged) before committing. Use `git add <file1> <file2> ...` with explicit paths — never `git add .` or `git add -A`.
 
 Use conventional commit format referencing the ticket ID:
 
@@ -284,14 +230,22 @@ fix(ORCH-42): handle empty password validation
 test(ORCH-42): add login endpoint integration tests
 ```
 
-- Commit only files relevant to the ticket.
-- Do not commit unrelated local changes.
+If `git commit` fails with `*.lock: File exists`, remove the stale lock and retry:
+
+```bash
+find .git -name "*.lock" -maxdepth 3 -type f
+rm .git/index.lock          # if index.lock exists
+git commit -m "..."         # retry
+```
+
+**If `git commit` fails for any other reason:** stop, add a ticket comment describing the exact error, and do not move the ticket to `Code Review`.
 
 ### Pull Requests
 
 - For new work: use `pr-create` to create a pull request.
 - For follow-up work: use `pr-update` to update the existing pull request.
-- Do not use raw `gh` commands for PR operations.
+- **NEVER use raw `gh pr create` or any raw `gh` command for PR operations.** These tools do not know the correct base branch and will create PRs against the wrong target.
+- **If `pr-create` returns an error**: stop immediately. Add a ticket comment with the exact error message. Move the ticket to `Rework`. Do NOT attempt to create the PR manually.
 - Include the ticket link.
 - Summarize the implementation.
 - List validation commands run and their results.
@@ -323,7 +277,7 @@ Stop if the branch or worktree state is unsafe or ambiguous.
 
 Understand relevant files, existing patterns, dependencies, tests, and validation commands.
 
-Run `impact` on symbols you plan to modify.
+Read each file **once**. Do not re-read files you have already read. Run `impact` on symbols you plan to modify — once per symbol, not per edit.
 
 ### Running Validation
 
@@ -336,7 +290,7 @@ validate(dir="./sub")   # run in a specific directory
 
 The tool returns PASS/FAIL per command with output. If it reports FAIL, fix the issues and call `validate` again.
 
-## Step 4: Implement
+### Step 4: Implement
 
 Make the smallest correct code change that satisfies the ticket.
 
@@ -356,29 +310,22 @@ On validation failure, retain to Hindsight with context `"validation-failure"` a
 
 ### Step 6: Commit
 
-Run mechanical checks. Commit only scoped changes with conventional commit format referencing the ticket ID.
+Commit in exactly these steps — do not add extra inspection commands:
 
-**If `git commit` fails with `*.lock: File exists`:**
+1. `git status` — one look at what is staged/unstaged (do not run again after this)
+2. `git add <specific files>` — explicit paths only, never `git add .` or `git add -A`
+3. `git commit -m "feat(ORCH-XX): description"` — conventional format with ticket ID
+4. `git push origin <branch>` — push immediately after commit
 
-A previous git process was interrupted and left a stale lock. Remove it and retry:
+Commit only scoped changes. Do not commit orch-managed files (`opencode.json`, `.opencode/`, `.orchestra/`, `.serena/`, `ORCH_DISPATCH_*.md`, `*.lock`, `.gitnexus/`).
 
-```bash
-# Find and remove stale lock files in the worktree's git dir
-find .git -name "*.lock" -maxdepth 3 -type f
-rm .git/index.lock          # if index.lock exists
-rm .git/MERGE_HEAD 2>/dev/null || true
-git commit -m "..."         # retry
-```
-
-Do not attempt to remove lock files outside the current worktree directory. If the lock is in an external path, stop and report the path in a ticket comment.
-
-**If `git commit` fails for any other reason:** stop, add a ticket comment describing the exact error, and do not move the ticket to `Code Review`.
+If commit fails, see the Commits section above for troubleshooting.
 
 ### Step 7: Pull Request
 
 Create (`pr-create`) or update (`pr-update`) the pull request.
 
-Push the branch.
+If `pr-create` fails, stop. Add a ticket comment with the error and move the ticket to `Rework`. Do NOT fall back to raw `gh` commands — they will target the wrong base branch.
 
 ### Step 8: Update Ticket
 
@@ -390,7 +337,7 @@ Report the result concisely.
 
 ## Step Limit Handling
 
-Your step budget is finite (check the dispatch payload for the limit). If you reach **step 45** and have not yet committed, pushed, and moved the ticket to `Code Review`, stop implementing immediately and do the following before your steps run out:
+Your step budget is finite (check the dispatch payload for the limit). If you reach **step 50** and have not yet committed, pushed, and moved the ticket to `Code Review`, stop implementing immediately and do the following before your steps run out:
 
 1. Write a ticket comment using `ticket-comment` with this exact format:
 

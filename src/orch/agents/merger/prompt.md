@@ -53,7 +53,6 @@ Expected project states:
 - `In Progress`
 - `Code Review`
 - `Ready to Merge`
-- `Human Merge`
 - `Needs Human Review`
 - `Done`
 

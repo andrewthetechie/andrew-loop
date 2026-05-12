@@ -1,4 +1,4 @@
-"""Worktree management: list and prune .orchestra/worktrees/."""
+"""Worktree management for worktrees stored in the orch state directory."""
 
 import asyncio
 import subprocess
@@ -6,7 +6,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from orch.config import Config
 from orch.db import Database
+from orch.state import resolve_state_dir
 from orch.tickets import get_ticket
 
 CheckFn = Callable[[Path], Awaitable[bool]]
@@ -29,19 +31,24 @@ class PruneResult:
 
 
 async def list_worktrees(db: Database, repo_root: Path) -> list[WorktreeInfo]:
-    """Scan .orchestra/worktrees/ and return info for each worktree."""
-    worktrees_dir = repo_root / ".orchestra" / "worktrees"
+    """Scan the state-dir worktrees tree and return info for each ticket worktree."""
+    config = Config.load(repo_root=repo_root)
+    state_dir = resolve_state_dir(repo_root, base_dir=config.state.base_dir)
+    worktrees_dir = state_dir / "worktrees"
     if not worktrees_dir.is_dir():
         return []
 
     infos: list[WorktreeInfo] = []
-    for child in sorted(worktrees_dir.iterdir()):
-        if not child.is_dir():
+    for issue_dir in sorted(worktrees_dir.iterdir()):
+        if not issue_dir.is_dir():
             continue
-        ticket_id = child.name
-        ticket = await get_ticket(db, ticket_id)
-        state = ticket.state if ticket else None
-        infos.append(WorktreeInfo(ticket_id=ticket_id, path=child, state=state))
+        for child in sorted(issue_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            ticket_id = child.name
+            ticket = await get_ticket(db, ticket_id)
+            state = ticket.state if ticket else None
+            infos.append(WorktreeInfo(ticket_id=ticket_id, path=child, state=state))
     return infos
 
 

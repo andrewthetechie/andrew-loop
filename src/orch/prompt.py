@@ -197,16 +197,46 @@ def _workflow_section(
 ) -> str:
     config = config or {}
     worktree_dir = config.get("worktree_dir", "")
-    step_budget = config.get("step_budget", 50) if config else 50
+    step_budget = config.get("step_budget", 60) if config else 60
+    # For high-risk reviewer dispatches, warn to write decision earlier.
+    # Risk 4+ requires thorough security review which consumes many steps; the
+    # reviewer must write REVIEW_DECISION before deep review so the ticket advances
+    # even if the step budget runs out mid-investigation.
+    risk_score = ticket.get("risk_score") or 0
+    if agent_type == "reviewer" and isinstance(risk_score, int) and risk_score >= 4:
+        write_decision_by = max(int(step_budget) // 2, int(step_budget) - 15)
+    else:
+        write_decision_by = int(step_budget) - 5
+
+    if agent_type == "coder":
+        budget_warning = (
+            f" (commit by step {write_decision_by}; if not finished,"
+            f" call ticket-comment with a handoff summary by step {write_decision_by})"
+        )
+    elif agent_type == "reviewer":
+        budget_warning = (
+            f" (write REVIEW_DECISION and update ticket no later than step {write_decision_by})"
+        )
+    else:
+        # merger and others: no reviewer-specific language
+        budget_warning = (
+            f" (complete merge and move ticket to final state by step {write_decision_by})"
+        )
+
     lines = [
         "## Workflow Instructions",
         f"- Agent Role: {agent_type}",
         f"- Current State (pre-dispatch): {ticket['state']}",
         "  Note: ticket will read as 'In Progress' at runtime — this is normal.",
         f"- Target State: {target_state}",
-        f"- Step Budget: {step_budget}"
-        f" (trigger continuation comment at step {int(step_budget) - 5})",
+        f"- Step Budget: {step_budget}{budget_warning}",
     ]
+    if agent_type == "reviewer" and isinstance(risk_score, int) and risk_score >= 4:
+        lines.append(
+            f"- **Risk {risk_score} ticket**: Deep security review required but step budget"
+            f" is limited. Write `## REVIEW_DECISION:` ticket comment by step"
+            f" {write_decision_by} at the latest. Do deep review after — revise if needed."
+        )
     if worktree_dir:
         lines += [
             f"- Working Directory: {worktree_dir}",

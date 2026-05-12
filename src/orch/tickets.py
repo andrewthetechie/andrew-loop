@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from graphlib import CycleError, TopologicalSorter
 
 import yaml
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from orch.db import VALID_STATES, Database, Event, Ticket, TicketComment, TicketDependency
@@ -425,6 +425,25 @@ async def add_dependencies(db: Database, ticket_id: str, depends_on_ids: list[st
         for dep_id in depends_on_ids:
             dep = TicketDependency(ticket_id=ticket_id, depends_on_ticket_id=dep_id)
             session.add(dep)
+        await session.commit()
+
+
+async def remove_dependencies(db: Database, ticket_id: str, depends_on_ids: list[str]) -> None:
+    """Remove dependency edges from a ticket."""
+    async with db.session() as session:
+        for tid in [ticket_id, *depends_on_ids]:
+            result = await session.execute(select(Ticket).where(Ticket.id == tid))
+            if result.scalar_one_or_none() is None:
+                msg = f"Ticket '{tid}' not found."
+                raise ValueError(msg)
+
+        if depends_on_ids:
+            await session.execute(
+                delete(TicketDependency).where(
+                    TicketDependency.ticket_id == ticket_id,
+                    TicketDependency.depends_on_ticket_id.in_(depends_on_ids),
+                )
+            )
         await session.commit()
 
 

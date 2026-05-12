@@ -26,6 +26,10 @@ class ValidationConfig(BaseModel):
     commands: list[str] = []
 
 
+class SetupConfig(BaseModel):
+    commands: list[str] = []
+
+
 class RouterConfig(BaseModel):
     poll_interval: float = 10.0
 
@@ -78,6 +82,7 @@ class Config(BaseModel):
     webhook: WebhookConfig = WebhookConfig()
     harness: HarnessConfig = HarnessConfig()
     validation: ValidationConfig = ValidationConfig()
+    setup: SetupConfig = SetupConfig()
     router: RouterConfig = RouterConfig()
     hindsight: HindsightConfig = HindsightConfig()
     mcp: McpConfig = McpConfig()

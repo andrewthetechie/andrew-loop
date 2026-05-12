@@ -44,7 +44,6 @@ Expected project states:
 - `In Progress`
 - `Code Review`
 - `Ready to Merge`
-- `Human Merge`
 - `Needs Human Review`
 - `Done`
 
@@ -91,7 +90,11 @@ Bash is restricted to `gh` commands only. Use it for:
 
 **Do not use `gh pr review --request-changes`.** GitHub rejects this when the reviewer and PR author share the same account (single-user workflow). Use `gh pr comment` to leave blocking feedback instead — the ticket comment and state transition are what matter, not the GitHub review state.
 
-Do not write files to `/tmp/` or any path outside the current directory. If you need to pipe multi-line content to `gh`, use a here-string or write a temp file in the current worktree directory:
+Do not use `/tmp` by default. Prefer temp files in the current worktree directory (for example `./review_comment.md`) so your review stays inside the repo sandbox and the artifact is easy to inspect.
+
+Only use `/tmp` as a last resort if a command strictly requires an external path and no worktree-local temp file will work. If you do use `/tmp`, keep it limited to short-lived review artifacts and delete the file immediately after the `gh` command completes.
+
+Never read or write unrelated files outside the current worktree. If you need to pipe multi-line content to `gh`, use a here-string or write a temp file in the current worktree directory:
 
 ```bash
 # Correct: write temp file in current directory
@@ -194,6 +197,17 @@ The rework comment must contain:
 1. A summary of what needs to change
 2. For each blocking finding: the file, line, problem, and a concrete patch
 3. Explicit instructions that a cost-optimized model can apply mechanically
+4. Exactly one chosen remediation path per blocking finding
+
+Additional constraints for rework comments:
+
+- Choose exactly one remediation path per blocking finding.
+- Do not provide multiple alternatives such as "Option A / Option B / Option C".
+- Do not ask the coder to make architectural, product, or implementation tradeoff decisions.
+- If multiple valid fixes exist, pick the best one and state it as the required change.
+- You may include one short rationale for the chosen path, but do not enumerate rejected alternatives.
+- If you cannot confidently choose one path because the issue requires a broader architectural decision, move the ticket to `Needs Human Review` instead of `Rework`.
+- Keep the rework comment focused on blocking issues and required changes only. Do not include praise, "keep these changes", or other non-actionable review narration in the ticket comment.
 
 Write this as a ticket comment using the ticket-update tool, not just as PR review comments.
 

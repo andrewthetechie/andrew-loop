@@ -2,7 +2,9 @@
 
 import asyncio
 import json
+import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import click
@@ -11,8 +13,9 @@ from click.shell_completion import get_completion_class
 from rich.console import Console
 from rich.table import Table
 
+from orch import state as orch_state
+from orch.config import Config
 from orch.db import VALID_STATES, Database
-from orch.decompose import run_decompose
 from orch.doctor import run_doctor
 from orch.init import default_runner, init_project
 from orch.metrics import get_issue_breakdown, list_issue_totals
@@ -34,6 +37,7 @@ from orch.tickets import (
     move_ticket,
     parse_ticket_yaml,
     promote_tickets,
+    remove_dependencies,
     ticket_to_dict,
     ticket_to_yaml,
     update_ticket,
@@ -42,6 +46,7 @@ from orch.tickets import (
 console = Console()
 
 DEFAULT_DB_PATH = ".orchestra/state.db"
+DECOMPOSE_DISPATCH_FILE = "ORCH_DECOMPOSE.md"
 
 TICKET_TEMPLATE = """\
 # Fill in the ticket fields below. Lines starting with # are ignored.
@@ -79,6 +84,86 @@ def _strip_yaml_comments(content: str) -> str:
 def _completion_var(prog_name: str) -> str:
     """Build the environment variable Click uses for shell completion."""
     return f"_{prog_name.replace('-', '_').upper()}_COMPLETE"
+
+
+def _extract_prd_title(content: str) -> str:
+    """Extract the first H1 heading from PRD markdown."""
+    match = re.search(r"^#\s+(.+?)\s*$", content, flags=re.MULTILINE)
+    if match is None:
+        msg = "PRD must include an H1 heading for the GitHub issue title."
+        raise ValueError(msg)
+    return match.group(1).strip()
+
+
+def _extract_issue_number(output: str) -> int:
+    """Extract the GitHub issue number from gh output."""
+    match = re.search(r"/issues/(\d+)", output)
+    if match is None:
+        msg = f"Could not determine GitHub issue number from output: {output!r}"
+        raise RuntimeError(msg)
+    return int(match.group(1))
+
+
+def _build_decompose_dispatch_payload(prd_body: str, issue_id: int, feature_branch: str) -> str:
+    """Build the prompt payload for the decomposer agent."""
+    return (
+        "DECOMPOSER DISPATCH\n\n"
+        f"Issue ID: {issue_id}\n"
+        f"Feature branch: {feature_branch}\n\n"
+        "When creating tickets, pass `issue_id` on every `ticket-create` call so all "
+        "tickets are linked to this PRD issue.\n\n"
+        "PRD:\n\n"
+        f"{prd_body}"
+    )
+
+
+async def _run_decompose_cmd(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
+    """Run a command asynchronously and return exit code, stdout, and stderr."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(cwd) if cwd else None,
+    )
+    stdout, stderr = await proc.communicate()
+    return proc.returncode or 0, stdout.decode(), stderr.decode()
+
+
+async def _launch_decompose_tui(repo_root: Path) -> int:
+    """Launch opencode TUI interactively with inherited stdio for Q&A sessions."""
+    proc = await asyncio.create_subprocess_exec("opencode", str(repo_root), cwd=str(repo_root))
+    return await proc.wait()
+
+
+async def _resolve_decompose_labels(
+    repo_root: Path, configured_labels: list[str], warn: Callable[[str], None] | None = None
+) -> list[str]:
+    """Return only labels that exist on the repo, warning on missing ones."""
+    if not configured_labels:
+        return []
+
+    code, stdout, _stderr = await _run_decompose_cmd(
+        ["gh", "label", "list", "--json", "name"], repo_root
+    )
+    if code != 0:
+        return configured_labels
+
+    existing = {item["name"] for item in json.loads(stdout or "[]")}
+    valid: list[str] = []
+    for label in configured_labels:
+        if label in existing:
+            valid.append(label)
+        elif warn is not None:
+            warn(f"GitHub label '{label}' does not exist on this repo; skipping it.")
+    return valid
+
+
+async def _remote_decompose_branch_exists(repo_root: Path, branch: str) -> bool:
+    """Return True when the branch already exists on origin."""
+    code, _stdout, _stderr = await _run_decompose_cmd(
+        ["git", "ls-remote", "--exit-code", "--heads", "origin", branch], repo_root
+    )
+    return code == 0
 
 
 @click.group()
@@ -492,6 +577,18 @@ def move(ctx: click.Context, ticket_id: str, new_state: str) -> None:
 @click.option("--linked-pr", help="PR URL.")
 @click.option("--assignee", help="Assignee.")
 @click.option(
+    "--add-dependency",
+    "add_dependencies_ids",
+    multiple=True,
+    help="Ticket ID to add as a dependency.",
+)
+@click.option(
+    "--remove-dependency",
+    "remove_dependencies_ids",
+    multiple=True,
+    help="Ticket ID to remove as a dependency.",
+)
+@click.option(
     "--reset-rework", "reset_rework", is_flag=True, help="Reset the rework loop count to 0."
 )
 @click.pass_context
@@ -501,6 +598,8 @@ def update(
     state: str | None,
     linked_pr: str | None,
     assignee: str | None,
+    add_dependencies_ids: tuple[str, ...],
+    remove_dependencies_ids: tuple[str, ...],
     reset_rework: bool,
 ) -> None:
     """Update specific fields on a ticket."""
@@ -519,6 +618,10 @@ def update(
                 if reset_rework:
                     fields["rework_loop_count"] = 0
                 ticket = await update_ticket(db, ticket_id, **fields)
+                if add_dependencies_ids:
+                    await add_dependencies(db, ticket_id, list(add_dependencies_ids))
+                if remove_dependencies_ids:
+                    await remove_dependencies(db, ticket_id, list(remove_dependencies_ids))
                 click.echo(f"Updated {ticket.id}")
             except ValueError as e:
                 click.echo(f"Error: {e}", err=True)
@@ -636,7 +739,7 @@ def promote(ctx: click.Context, ticket_id: str | None) -> None:
 @tickets.command("human-review")
 @click.pass_context
 def human_review_cmd(ctx: click.Context) -> None:
-    """Show all tickets requiring human attention (Needs Human Review + Human Merge)."""
+    """Show all tickets requiring human attention."""
 
     _HUMAN_STATES = ("Needs Human Review", "Human Merge")
 
@@ -805,12 +908,10 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
 )
 def decompose_cmd(prd_path: Path, issue_id: int | None, no_active: bool) -> None:
     """Create/update a PRD issue, prepare its branch, and dispatch the decomposer."""
-    import click as _click
-
     repo_root = Path.cwd()
 
     def _confirm(target_issue: int) -> bool:
-        return _click.confirm(f"Overwrite GitHub issue #{target_issue} with this PRD?")
+        return click.confirm(f"Overwrite GitHub issue #{target_issue} with this PRD?")
 
     def _warn(message: str) -> None:
         click.echo(f"Warning: {message}")
@@ -818,16 +919,78 @@ def decompose_cmd(prd_path: Path, issue_id: int | None, no_active: bool) -> None
     def _info(message: str) -> None:
         click.echo(message)
 
+    async def _decompose() -> int:
+        cfg = Config.load(repo_root=repo_root)
+        prd_body = await asyncio.to_thread(prd_path.read_text)
+        title = _extract_prd_title(prd_body)
+        overwrite_issue = issue_id is not None
+        created_issue = issue_id
+
+        if created_issue is None:
+            labels = await _resolve_decompose_labels(repo_root, cfg.github.prd_labels, _warn)
+            cmd = ["gh", "issue", "create", "--title", title, "--body-file", str(prd_path)]
+            for label in labels:
+                cmd.extend(["--label", label])
+            _info(f"Creating GitHub issue: {title!r}...")
+            code, stdout, stderr = await _run_decompose_cmd(cmd, repo_root)
+            if code != 0:
+                msg = stderr.strip() or "gh issue create failed"
+                raise RuntimeError(msg)
+            created_issue = _extract_issue_number(stdout.strip())
+            _info(f"✓ Issue #{created_issue} created")
+        else:
+            if not _confirm(created_issue):
+                raise RuntimeError("Aborted.")
+            code, _stdout, stderr = await _run_decompose_cmd(
+                ["gh", "issue", "edit", str(created_issue), "--body-file", str(prd_path)],
+                repo_root,
+            )
+            if code != 0:
+                msg = stderr.strip() or "gh issue edit failed"
+                raise RuntimeError(msg)
+            _info(f"✓ Issue #{created_issue} updated")
+
+        feature_branch = f"issue-{created_issue}"
+        if overwrite_issue and await _remote_decompose_branch_exists(repo_root, feature_branch):
+            _info(f"✓ Remote branch {feature_branch} already exists; reusing it.")
+        else:
+            _info(f"Creating feature branch {feature_branch!r}...")
+            code, _stdout, stderr = await _run_decompose_cmd(
+                ["git", "checkout", "-b", feature_branch], repo_root
+            )
+            if code != 0:
+                msg = stderr.strip() or "git checkout failed"
+                raise RuntimeError(msg)
+
+            _info(f"Pushing {feature_branch!r} to origin...")
+            code, _stdout, stderr = await _run_decompose_cmd(
+                ["git", "push", "-u", "origin", feature_branch], repo_root
+            )
+            if code != 0:
+                msg = stderr.strip() or "git push failed"
+                raise RuntimeError(msg)
+            _info(f"✓ Feature branch {feature_branch!r} pushed")
+
+        if not no_active:
+            orch_state.write_active_issue(repo_root, created_issue, base_dir=cfg.state.base_dir)
+
+        payload = _build_decompose_dispatch_payload(prd_body, created_issue, feature_branch)
+        dispatch_file = repo_root / DECOMPOSE_DISPATCH_FILE
+        await asyncio.to_thread(dispatch_file.write_text, payload)
+        _info(f"✓ Dispatch payload written to {DECOMPOSE_DISPATCH_FILE}")
+        _info("")
+        _info("Launching decomposer (interactive Q&A session).")
+        _info(f"  In opencode, select the 'decomposer' agent and read {DECOMPOSE_DISPATCH_FILE}.")
+        _info("")
+
+        exit_code = await _launch_decompose_tui(repo_root)
+        if exit_code != 0:
+            msg = f"opencode exited with code {exit_code}"
+            raise RuntimeError(msg)
+        return created_issue
+
     try:
-        created_issue = run_decompose(
-            repo_root,
-            prd_path,
-            issue_id=issue_id,
-            no_active=no_active,
-            confirm_overwrite=_confirm,
-            warn=_warn,
-            info=_info,
-        )
+        created_issue = _run(_decompose())
     except (RuntimeError, ValueError) as e:
         click.echo(f"Error: {e}", err=True)
         raise SystemExit(1) from e

@@ -8,10 +8,11 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from rich.console import Console, ConsoleOptions, RenderResult
+from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
@@ -29,6 +30,7 @@ class _LiveRenderable:
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         yield from console.render(self._render_fn(), options)
+
 
 # Approximate context window limits by model name fragment (lowercase match)
 _CONTEXT_LIMITS: list[tuple[str, int]] = [
@@ -87,6 +89,11 @@ class RouterTUI:
         self._ticket_title: str = "—"
         self._ticket_state: str = "—"
         self._total_tickets: int = 0
+        self._issue_label: str = "—"
+        self._issue_tickets: list[tuple[str, str]] = []
+        self._risk_score: int | None = None
+        self._rework_count: int = 0
+        self._dependencies: list[str] = []
 
         # Router state
         self._stage: str = "polling"
@@ -143,6 +150,11 @@ class RouterTUI:
         ticket_state: str,
         agent_type: str,
         total_tickets: int = 0,
+        issue_label: str = "—",
+        issue_tickets: list[tuple[str, str]] | None = None,
+        risk_score: int | None = None,
+        rework_count: int = 0,
+        dependencies: list[str] | None = None,
         model: str = "",
         step_budget: int = 50,
     ) -> None:
@@ -150,6 +162,11 @@ class RouterTUI:
         self._ticket_title = ticket_title
         self._ticket_state = ticket_state
         self._total_tickets = total_tickets
+        self._issue_label = issue_label
+        self._issue_tickets = issue_tickets or []
+        self._risk_score = risk_score
+        self._rework_count = rework_count
+        self._dependencies = dependencies or []
         self._stage = f"dispatching {agent_type}"
         self._stage_start = datetime.now()
         self._dispatch_start = datetime.now()
@@ -170,6 +187,10 @@ class RouterTUI:
 
     def set_ticket_state(self, state: str) -> None:
         self._ticket_state = state
+        self._issue_tickets = [
+            (ticket_id, state if ticket_id == self._ticket_id else ticket_state)
+            for ticket_id, ticket_state in self._issue_tickets
+        ]
         self._refresh()
 
     def on_agent_done(self) -> None:
@@ -310,13 +331,30 @@ class RouterTUI:
 
     def _render_ticket_info(self) -> Panel:
         t = Table.grid(padding=(0, 2))
-        t.add_column(style="dim", no_wrap=True)
-        t.add_column(overflow="ellipsis", no_wrap=True)
+        # min_width covers the longest label ("Total tickets" = 13 chars) so Rich never
+        # truncates labels. The value column takes remaining space and truncates values.
+        t.add_column(style="dim", no_wrap=True, min_width=13)
+        t.add_column(overflow="ellipsis", no_wrap=True, ratio=1)
         t.add_row("Ticket", f"[bold cyan]{self._ticket_id}[/bold cyan]")
         t.add_row("Title", self._ticket_title)
+        t.add_row("Risk", str(self._risk_score) if self._risk_score is not None else "—")
         t.add_row("Status", f"[yellow]{self._ticket_state}[/yellow]")
+        t.add_row("Rework Count", str(self._rework_count))
+        t.add_row("Dependencies", "\n".join(self._dependencies) if self._dependencies else "—")
+        t.add_row("Issue", self._issue_label)
         t.add_row("Total tickets", str(self._total_tickets))
-        return Panel(t, title="[bold]Ticket Info[/bold]", border_style="blue")
+
+        issue_table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+        issue_table.add_column("Ticket ID", no_wrap=True)
+        issue_table.add_column("Status", overflow="ellipsis", ratio=1)
+        if self._issue_tickets:
+            for ticket_id, ticket_state in self._issue_tickets:
+                issue_table.add_row(ticket_id, ticket_state)
+        else:
+            issue_table.add_row("—", "—")
+
+        body = Group(t, Rule(style="blue"), issue_table)
+        return Panel(body, title="[bold]Ticket Info[/bold]", border_style="blue")
 
     def _render_router_info(self) -> Panel:
         t = Table.grid(padding=(0, 2))

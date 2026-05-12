@@ -26,12 +26,14 @@ from __future__ import annotations
 import re
 import subprocess
 import tomllib
+from functools import cache
 from pathlib import Path
 from typing import Any
 
 _ORCHESTRA_ID_FILE = ".orchestra-id"
 
 
+@cache
 def repo_id_from_remote(repo_root: Path) -> str:
     """Derive a directory-safe repo identifier from the git remote URL.
 

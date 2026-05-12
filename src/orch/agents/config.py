@@ -90,7 +90,7 @@ def coder_agent_config() -> AgentConfig:
         description="Implements tickets using test-first development",
         mode="primary",
         temperature=0.1,
-        steps=50,
+        steps=60,
         prompt_file="coder.md",
         permission={
             "edit": "allow",
@@ -123,7 +123,7 @@ def reviewer_agent_config() -> AgentConfig:
         description="Reviews pull requests for code quality and security",
         mode="primary",
         temperature=0.3,
-        steps=50,
+        steps=85,
         prompt_file="reviewer.md",
         permission={
             "read": "allow",
@@ -131,6 +131,10 @@ def reviewer_agent_config() -> AgentConfig:
             "grep": "allow",
             "list": "allow",
             "bash": "allow",
+            "external_directory": {
+                "/tmp/**": "allow",
+                "/private/tmp/**": "allow",
+            },
             "edit": "deny",
             "task": "deny",
             "websearch": "deny",
@@ -153,7 +157,7 @@ def merger_agent_config() -> AgentConfig:
         description="Verifies scope match and merges eligible pull requests",
         mode="primary",
         temperature=0.1,
-        steps=15,
+        steps=30,
         prompt_file="merger.md",
         permission={
             "read": "allow",

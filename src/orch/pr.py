@@ -54,7 +54,19 @@ async def create_pr(
     if base_branch is None:
         base_branch = feature_branch_name(ticket.issue_id)
 
-    title = f"ticket/{ticket_id}: {ticket.title}"
+    # Derive the head branch name from the ticket's worktree branch convention.
+    issue_slug = f"issue-{ticket.issue_id}" if ticket.issue_id is not None else "no-issue"
+    head_branch = f"ticket/{issue_slug}/{ticket_id}"
+
+    # Push the ticket branch to origin so it exists on remote before PR creation.
+    push_rc, _push_out, push_err = await run(
+        ["git", "push", "-u", "origin", f"HEAD:{head_branch}"], cwd
+    )
+    if push_rc != 0:
+        msg = f"git push failed (exit {push_rc}): {push_err}"
+        raise RuntimeError(msg)
+
+    title = f"feat({ticket_id}): {ticket.title}"
     body = (
         f"## {ticket.title}\n\n"
         f"{ticket.description}\n\n"
@@ -72,6 +84,8 @@ async def create_pr(
         body,
         "--base",
         base_branch,
+        "--head",
+        head_branch,
     ]
 
     returncode, stdout, stderr = await run(cmd, cwd)
@@ -102,7 +116,13 @@ async def update_pr(
         msg = f"Ticket '{ticket_id}' has no linked PR."
         raise ValueError(msg)
 
-    returncode, _stdout, stderr = await run(["git", "push"], cwd)
+    # Push explicitly to the ticket branch to avoid upstream mismatches.
+    issue_slug = f"issue-{ticket.issue_id}" if ticket.issue_id is not None else "no-issue"
+    head_branch = f"ticket/{issue_slug}/{ticket_id}"
+
+    returncode, _stdout, stderr = await run(
+        ["git", "push", "origin", f"HEAD:{head_branch}"], cwd
+    )
     if returncode != 0:
         msg = f"git push failed (exit {returncode}): {stderr}"
         raise RuntimeError(msg)
