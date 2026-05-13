@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import re
+import select
+import signal
+import sys
+import termios
+import threading
+import tty
 from collections import deque
 from collections.abc import Callable
 from datetime import datetime
@@ -11,6 +19,7 @@ from typing import Any
 from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.layout import Layout
 from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
@@ -46,6 +55,7 @@ _CONTEXT_LIMITS: list[tuple[str, int]] = [
 ]
 _DEFAULT_CONTEXT_LIMIT = 128_000
 _BAR_WIDTH = 20
+_ABSOLUTE_PATH_RE = re.compile(r"/[^\s<>]+(?:/[^\s<>]+)+")
 
 
 def _context_limit(model: str) -> int:
@@ -83,6 +93,9 @@ class RouterTUI:
         self._live: Live | None = None
         self._log: deque[Text] = deque(maxlen=self.MAX_LOG_LINES)
         self._agent_text: deque[Text] = deque(maxlen=self.MAX_LOG_LINES)
+        self._event_log_scroll_offset = 0
+        self._keyboard_stop = threading.Event()
+        self._keyboard_thread: threading.Thread | None = None
 
         # Ticket state
         self._ticket_id: str = "—"
@@ -108,6 +121,7 @@ class RouterTUI:
         self._agent_model: str = "—"
         self._context_used: int = 0  # input tokens in current step
         self._context_limit: int = _DEFAULT_CONTEXT_LIMIT
+        self._root_session_id: str = ""  # first sessionID seen = parent agent
         self._step_budget: int = 50
         self._total_cost: float = 0.0
 
@@ -124,15 +138,18 @@ class RouterTUI:
             vertical_overflow="visible",
         )
         self._live.__enter__()
+        self._start_keyboard_listener()
         self._refresh()
         return self
 
     def __exit__(self, *args: object) -> None:
+        self._stop_keyboard_listener()
         if self._live:
             self._live.__exit__(*args)
 
     def pause(self) -> None:
         """Temporarily stop the live display (e.g. to show an interactive prompt)."""
+        self._stop_keyboard_listener()
         if self._live and self._live.is_started:
             self._live.stop()
 
@@ -140,6 +157,7 @@ class RouterTUI:
         """Restart the live display after a pause."""
         if self._live and not self._live.is_started:
             self._live.start(refresh=True)
+            self._start_keyboard_listener()
 
     # ── Status updates (called by Router) ──────────────────────────────────────
 
@@ -176,6 +194,7 @@ class RouterTUI:
         self._agent_model = model or "—"
         self._context_used = 0
         self._context_limit = _context_limit(model)
+        self._root_session_id = ""
         self._step_budget = step_budget
         self._total_cost = 0.0
         self._refresh()
@@ -214,6 +233,35 @@ class RouterTUI:
         else:
             line.append_text(Text.from_markup(msg))
         self._log.append(line)
+        self._event_log_scroll_offset = min(
+            self._event_log_scroll_offset,
+            self._max_event_log_scroll_offset(),
+        )
+        self._refresh()
+
+    def scroll_event_log_up(self, lines: int | None = None) -> None:
+        """Move the Event Log viewport toward older entries."""
+        amount = lines if lines is not None else self._visible_log_height()
+        self._event_log_scroll_offset = min(
+            self._event_log_scroll_offset + max(1, amount),
+            self._max_event_log_scroll_offset(),
+        )
+        self._refresh()
+
+    def scroll_event_log_down(self, lines: int | None = None) -> None:
+        """Move the Event Log viewport toward newer entries."""
+        amount = lines if lines is not None else self._visible_log_height()
+        self._event_log_scroll_offset = max(0, self._event_log_scroll_offset - max(1, amount))
+        self._refresh()
+
+    def scroll_event_log_to_latest(self) -> None:
+        """Return the Event Log viewport to follow-latest mode."""
+        self._event_log_scroll_offset = 0
+        self._refresh()
+
+    def scroll_event_log_to_oldest(self) -> None:
+        """Move the Event Log viewport to the oldest retained entries."""
+        self._event_log_scroll_offset = self._max_event_log_scroll_offset()
         self._refresh()
 
     def parse_agent_line(self, ticket_id: str, raw: bytes) -> None:
@@ -236,17 +284,20 @@ class RouterTUI:
             self.log(f"[bold cyan]{ticket_id}[/bold cyan] step {self._step}")
 
         elif event_type == "step_finish":
+            session_id = data.get("sessionID", "")
             tokens = part.get("tokens", {})
             cost = part.get("cost", 0)
             total_tok = tokens.get("total", 0)
             cost_str = f"${cost:.4f}" if cost else "—"
             reason = part.get("reason", "")
 
-            # Use total tokens as context proxy — robust across all providers.
-            # Local models (opencode-go/qwen, glm) often don't report input/output
-            # breakdown separately. total_tok grows with each step as context accumulates
-            # and is always a reliable non-zero signal of context window usage.
-            if total_tok:
+            # Lock onto the first sessionID as the parent agent. Subagents
+            # emit step_finish events with different sessionIDs and their own
+            # cumulative token counts which would inflate the context display.
+            if not self._root_session_id and session_id:
+                self._root_session_id = session_id
+
+            if total_tok and session_id == self._root_session_id:
                 self._context_used = total_tok
 
             if cost:
@@ -278,15 +329,20 @@ class RouterTUI:
             state = part.get("state", {})
             status = state.get("status", "?")
             inp = state.get("input", {})
+            if self._is_task_tool(tool):
+                self._log_task_tool_event(tool, status, inp, state)
+                self._refresh()
+                return
+
             self._last_tool = tool
             brief = self._tool_brief(tool, inp)
 
             if status == "completed":
                 output_raw = str(state.get("output", ""))
-                output = output_raw.replace("\n", " ")[:100]
+                output = self._compact_log_fragment(output_raw, max_chars=80)
                 self.log(f"  [green]✓[/green] [cyan]{tool}[/cyan]{brief}  [dim]{output}[/dim]")
             elif status == "error":
-                err = str(state.get("error", ""))[:100]
+                err = self._compact_log_fragment(str(state.get("error", "")), max_chars=80)
                 self.log(f"  [red]✗[/red] [cyan]{tool}[/cyan]{brief}  [red]{err}[/red]")
             else:
                 self.log(f"  [yellow]...[/yellow] [cyan]{tool}[/cyan]{brief}")
@@ -294,6 +350,62 @@ class RouterTUI:
             self._refresh()
 
     # ── Internal rendering ──────────────────────────────────────────────────────
+
+    def _log_task_tool_event(
+        self,
+        tool: str,
+        status: str,
+        inp: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        helper = self._task_helper_name(inp)
+        task = self._task_description(inp)
+        task_suffix = f": {escape(task)}" if task else ""
+        self._last_tool = f"{tool}:{helper}"
+
+        if status == "completed":
+            output = self._compact_log_fragment(str(state.get("output", "")), max_chars=80)
+            self.log(f"  [green]✓[/green] [cyan]{helper} done[/cyan]  [dim]{escape(output)}[/dim]")
+            stream = f"{helper} finished"
+            if output:
+                stream += f": {output}"
+            self._agent_text.append(Text(stream[:120], style="italic"))
+        elif status == "error":
+            err = self._compact_log_fragment(str(state.get("error", "")), max_chars=80)
+            self.log(f"  [red]✗[/red] [cyan]{helper} failed[/cyan]  [red]{escape(err)}[/red]")
+            stream = f"{helper} failed"
+            if err:
+                stream += f": {err}"
+            self._agent_text.append(Text(stream[:120], style="italic red"))
+        else:
+            self.log(f"  [yellow]...[/yellow] [cyan]{helper} working[/cyan]{task_suffix}")
+            stream = f"{helper} working"
+            if task:
+                stream += f": {task}"
+            self._agent_text.append(Text(stream[:120], style="italic"))
+
+    @staticmethod
+    def _is_task_tool(tool: str) -> bool:
+        return str(tool).lower() == "task"
+
+    @staticmethod
+    def _task_helper_name(inp: dict[str, Any]) -> str:
+        for key in ("subagent_type", "agent", "agent_type", "helper", "role"):
+            value = str(inp.get(key, "")).strip()
+            if value:
+                return value
+        return "helper"
+
+    @staticmethod
+    def _task_description(inp: dict[str, Any]) -> str:
+        for key in ("description", "task", "title", "instructions", "prompt"):
+            value = str(inp.get(key, "")).strip()
+            if value:
+                for line in value.splitlines():
+                    stripped = line.strip()
+                    if stripped:
+                        return RouterTUI._compact_log_fragment(stripped, max_chars=80)
+        return ""
 
     def _build_layout(self) -> Layout:
         layout = Layout()
@@ -405,20 +517,42 @@ class RouterTUI:
 
         return Panel(t, title="[bold]Agent Info[/bold]", border_style="magenta")
 
-    def _tail_lines(self, lines: deque[Text] | list[Text]) -> Text:
+    def _visible_log_height(self) -> int:
         term_height = self._console.height or 40
-        log_height = max(5, (term_height * 2 // 3) - 4)
+        return max(5, (term_height * 2 // 3) - 4)
+
+    def _max_event_log_scroll_offset(self) -> int:
+        return max(0, len(self._log) - self._visible_log_height())
+
+    def _tail_lines(self, lines: deque[Text] | list[Text], *, scroll_offset: int = 0) -> Text:
+        log_height = self._visible_log_height()
+        max_line_width = max(24, (self._console.width or 80) // 2 - 8)
+        all_lines = list(lines)
+        if scroll_offset:
+            offset = min(scroll_offset, max(0, len(all_lines) - log_height))
+            end = max(0, len(all_lines) - offset)
+            visible_lines = all_lines[max(0, end - log_height) : end]
+        else:
+            visible_lines = all_lines[-log_height:]
+
         combined = Text()
-        for i, line in enumerate(list(lines)[-log_height:]):
+        for i, line in enumerate(visible_lines):
             if i:
                 combined.append("\n")
-            combined.append_text(line)
+            display_line = line.copy()
+            display_line.truncate(max_line_width, overflow="ellipsis")
+            combined.append_text(display_line)
         return combined
 
     def _render_event_log(self) -> Panel:
+        title = "[bold]Event Log[/bold]"
+        if self._event_log_scroll_offset:
+            title += f" [dim](scroll +{self._event_log_scroll_offset}, End/latest)[/dim]"
+        else:
+            title += " [dim](PgUp/PgDn, k/j)[/dim]"
         return Panel(
-            self._tail_lines(self._log),
-            title="[bold]Event Log[/bold]",
+            self._tail_lines(self._log, scroll_offset=self._event_log_scroll_offset),
+            title=title,
             border_style="dim",
             padding=(0, 1),
         )
@@ -431,6 +565,66 @@ class RouterTUI:
             padding=(0, 1),
         )
 
+    def _start_keyboard_listener(self) -> None:
+        if self._keyboard_thread and self._keyboard_thread.is_alive():
+            return
+        stream = sys.stdin
+        if not stream.isatty():
+            return
+        self._keyboard_stop.clear()
+        self._keyboard_thread = threading.Thread(
+            target=self._keyboard_loop,
+            name="orch-tui-keyboard",
+            daemon=True,
+        )
+        self._keyboard_thread.start()
+
+    def _stop_keyboard_listener(self) -> None:
+        self._keyboard_stop.set()
+        if self._keyboard_thread and self._keyboard_thread.is_alive():
+            self._keyboard_thread.join(timeout=0.2)
+        self._keyboard_thread = None
+
+    def _keyboard_loop(self) -> None:
+        fd = sys.stdin.fileno()
+        with contextlib.suppress(termios.error, OSError):
+            old_attrs = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                while not self._keyboard_stop.is_set():
+                    readable, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    if not readable:
+                        continue
+                    key = sys.stdin.read(1)
+                    if key == "\x03":
+                        signal.raise_signal(signal.SIGINT)
+                        continue
+                    if key == "\x1b":
+                        key = self._read_escape_sequence(key)
+                    self._handle_key(key)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+    @staticmethod
+    def _read_escape_sequence(prefix: str) -> str:
+        sequence = prefix
+        while len(sequence) < 4:
+            readable, _, _ = select.select([sys.stdin], [], [], 0.01)
+            if not readable:
+                break
+            sequence += sys.stdin.read(1)
+        return sequence
+
+    def _handle_key(self, key: str) -> None:
+        if key in ("k", "\x1b[5~", "\x1b[A"):
+            self.scroll_event_log_up()
+        elif key in ("j", "\x1b[6~", "\x1b[B"):
+            self.scroll_event_log_down()
+        elif key in ("g", "\x1b[H", "\x1b[1~"):
+            self.scroll_event_log_to_oldest()
+        elif key in ("G", "\x1b[F", "\x1b[4~"):
+            self.scroll_event_log_to_latest()
+
     @staticmethod
     def _elapsed(start: datetime | None) -> str:
         if start is None:
@@ -441,7 +635,7 @@ class RouterTUI:
     @staticmethod
     def _tool_brief(tool: str, inp: dict[str, Any]) -> str:
         if tool == "read":
-            path = inp.get("filePath", "")
+            path = RouterTUI._compact_path(str(inp.get("filePath", "")))
             offset = inp.get("offset")
             limit = inp.get("limit")
             suffix = f":{offset}" if offset else ""
@@ -452,7 +646,8 @@ class RouterTUI:
         if tool == "grep":
             return f": {inp.get('pattern', '')!r}"
         if tool in ("edit", "write"):
-            return f": {inp.get('filePath', '')}"
+            path = RouterTUI._compact_path(str(inp.get("filePath", "")))
+            return f": {path}" if path else ""
         if tool == "bash":
             cmd = inp.get("command", "")[:80]
             return f": {cmd}" if cmd else ""
@@ -461,4 +656,38 @@ class RouterTUI:
             return f" → {state}" if state else ""
         if tool == "ticket-read":
             return f": {inp.get('ticket_id', '')}"
+        if RouterTUI._is_task_tool(tool):
+            helper = RouterTUI._task_helper_name(inp)
+            task = RouterTUI._task_description(inp)
+            return f": {helper} - {task}" if task else f": {helper}"
         return ""
+
+    @staticmethod
+    def _compact_log_fragment(value: str, *, max_chars: int) -> str:
+        one_line = value.replace("\n", " ")
+        one_line = _ABSOLUTE_PATH_RE.sub(
+            lambda match: RouterTUI._compact_path(match.group(0), max_chars=48),
+            one_line,
+        )
+        if len(one_line) > max_chars:
+            return one_line[: max_chars - 3] + "..."
+        return one_line
+
+    @staticmethod
+    def _compact_path(path: str, *, max_chars: int = 72) -> str:
+        if len(path) <= max_chars:
+            return path
+
+        parts = [part for part in path.split("/") if part]
+        tail: list[str] = []
+        budget = max_chars - 4
+        used = 0
+        for part in reversed(parts):
+            next_used = used + len(part) + (1 if tail else 0)
+            if next_used > budget:
+                break
+            tail.insert(0, part)
+            used = next_used
+        if not tail:
+            return "..." + path[-budget:]
+        return ".../" + "/".join(tail)

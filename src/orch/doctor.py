@@ -59,6 +59,135 @@ async def _check_db_schema(db_path: Path) -> CheckResult:
     return CheckResult("database", True, "database schema valid")
 
 
+async def _check_hindsight(repo_root: Path, cfg: object) -> CheckResult:
+    """Verify configured Hindsight bank is reachable and useful for agent memory."""
+    hindsight_cfg = getattr(cfg, "hindsight", None)
+    base_bank_id = str(getattr(hindsight_cfg, "bank_id", "") or "")
+    url = str(getattr(hindsight_cfg, "url", "") or "")
+    api_key = str(getattr(hindsight_cfg, "api_key", "") or "")
+    if not base_bank_id:
+        return CheckResult("hindsight", True, "optional: not configured")
+
+    bank_id = f"{base_bank_id}-{repo_root.name}"
+    client = None
+    try:
+        from hindsight_client import Hindsight
+
+        client = Hindsight(base_url=url, api_key=api_key or None, timeout=15.0)
+        await client.banks.get_bank_profile(bank_id)
+        config_response = await _aget_bank_config(client, bank_id)
+        bank_config = _extract_bank_config(config_response)
+        missing = _missing_hindsight_memory_config(bank_config)
+        stats = await _aget_bank_stats(client, bank_id)
+    except Exception as exc:
+        detail = str(exc) or exc.__class__.__name__
+        return CheckResult("hindsight", False, f"{bank_id} unreachable or invalid: {detail}")
+    finally:
+        if client is not None and hasattr(client, "aclose"):
+            await client.aclose()
+
+    if missing:
+        return CheckResult(
+            "hindsight",
+            False,
+            f"{bank_id} missing coding-agent config: {', '.join(missing)}",
+        )
+
+    return CheckResult(
+        "hindsight",
+        True,
+        (
+            f"{bank_id} reachable; memory units: {_stat_value(stats, 'total_nodes')}; "
+            f"documents: {_stat_value(stats, 'total_documents')}; "
+            f"observations: {_observation_count(stats)}"
+        ),
+    )
+
+
+async def _aget_bank_config(client: object, bank_id: str) -> object:
+    """Read resolved Hindsight bank config across SDK versions."""
+    method = getattr(client, "aget_bank_config", None)
+    if method is not None:
+        return await method(bank_id)
+
+    method = getattr(client, "_aget_bank_config", None)
+    if method is not None:
+        return await method(bank_id)
+
+    method = getattr(client, "get_bank_config", None)
+    if method is not None:
+        result = method(bank_id)
+        if hasattr(result, "__await__"):
+            return await result
+        return result
+
+    banks = getattr(client, "banks", None)
+    method = getattr(banks, "get_bank_config", None)
+    if method is not None:
+        return await method(bank_id)
+
+    return {}
+
+
+async def _aget_bank_stats(client: object, bank_id: str) -> object:
+    """Read Hindsight bank stats across SDK versions."""
+    banks = getattr(client, "banks", None)
+    for owner in (banks, client):
+        if owner is None:
+            continue
+        for name in ("get_agent_stats", "get_bank_stats"):
+            method = getattr(owner, name, None)
+            if method is None:
+                continue
+            result = method(bank_id)
+            if hasattr(result, "__await__"):
+                return await result
+            return result
+    return {}
+
+
+def _extract_bank_config(response: object) -> dict[str, object]:
+    """Return resolved config from a Hindsight config response."""
+    if isinstance(response, dict):
+        value = response.get("config", response)
+        return dict(value) if isinstance(value, dict) else {}
+
+    value = getattr(response, "config", response)
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _missing_hindsight_memory_config(config: dict[str, object]) -> list[str]:
+    missing: list[str] = []
+    if not str(config.get("retain_mission") or "").strip():
+        missing.append("retain_mission")
+    if not config.get("enable_observations"):
+        missing.append("enable_observations")
+    if not str(config.get("observations_mission") or "").strip():
+        missing.append("observations_mission")
+    return missing
+
+
+def _stat_value(stats: object, name: str) -> int:
+    if isinstance(stats, dict):
+        return int(stats.get(name, 0) or 0)
+    return int(getattr(stats, name, 0) or 0)
+
+
+def _observation_count(stats: object) -> int:
+    explicit = _stat_value(stats, "total_observations")
+    if explicit:
+        return explicit
+    if isinstance(stats, dict):
+        nodes_by_type = stats.get("nodes_by_fact_type", {})
+    else:
+        nodes_by_type = getattr(stats, "nodes_by_fact_type", {})
+    if isinstance(nodes_by_type, dict):
+        return int(nodes_by_type.get("observation", 0) or 0)
+    return 0
+
+
 def _check_opencode_mcps(repo_root: Path) -> CheckResult:
     """Verify all required MCPs are configured in opencode.json.
 
@@ -151,6 +280,9 @@ async def run_doctor(
 
     # opencode MCP configuration check
     result.checks.append(_check_opencode_mcps(repo_root))
+
+    # Hindsight bank quality check
+    result.checks.append(await _check_hindsight(repo_root, cfg))
 
     # CLI tool checks
     if tool_runner is not None:

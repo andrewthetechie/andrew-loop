@@ -120,9 +120,7 @@ async def update_pr(
     issue_slug = f"issue-{ticket.issue_id}" if ticket.issue_id is not None else "no-issue"
     head_branch = f"ticket/{issue_slug}/{ticket_id}"
 
-    returncode, _stdout, stderr = await run(
-        ["git", "push", "origin", f"HEAD:{head_branch}"], cwd
-    )
+    returncode, _stdout, stderr = await run(["git", "push", "origin", f"HEAD:{head_branch}"], cwd)
     if returncode != 0:
         msg = f"git push failed (exit {returncode}): {stderr}"
         raise RuntimeError(msg)

@@ -7,7 +7,15 @@ import yaml
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from orch.db import VALID_STATES, Database, Event, Ticket, TicketComment, TicketDependency
+from orch.db import (
+    VALID_STATES,
+    Database,
+    Event,
+    SubtaskContext,
+    Ticket,
+    TicketComment,
+    TicketDependency,
+)
 
 # Fields that can appear in the ticket YAML
 YAML_FIELDS = (
@@ -363,6 +371,47 @@ async def add_comment(
         session.add(comment)
         await session.commit()
         return comment
+
+
+async def record_delegation_output(
+    db: Database,
+    ticket_id: str,
+    *,
+    helper_role: str,
+    output: str,
+) -> SubtaskContext:
+    """Record hidden-helper output for parent-ticket observability."""
+    async with db.session() as session:
+        result = await session.execute(select(Ticket).where(Ticket.id == ticket_id))
+        ticket = result.scalar_one_or_none()
+        if ticket is None:
+            msg = f"Ticket '{ticket_id}' not found."
+            raise ValueError(msg)
+
+        context = SubtaskContext(
+            ticket_id=ticket_id,
+            step=f"delegation:{helper_role}",
+            output=output,
+            created_at=_now_iso(),
+        )
+        session.add(context)
+        await session.commit()
+        await session.refresh(context)
+        return context
+
+
+async def list_delegation_context(db: Database, ticket_id: str) -> list[SubtaskContext]:
+    """List hidden-helper outputs recorded for a parent ticket."""
+    async with db.session() as session:
+        result = await session.execute(
+            select(SubtaskContext)
+            .where(
+                SubtaskContext.ticket_id == ticket_id,
+                SubtaskContext.step.like("delegation:%"),
+            )
+            .order_by(SubtaskContext.id)
+        )
+        return list(result.scalars().all())
 
 
 async def _get_all_ticket_ids(session: AsyncSession) -> list[str]:

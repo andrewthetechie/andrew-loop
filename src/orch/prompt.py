@@ -33,6 +33,7 @@ def build_dispatch_prompt(
     config = config or {}
     comments = comments or []
     mental_models = mental_models or {}
+    hindsight_context = config.get("hindsight_context") or {}
 
     # Ticket data
     sections.append(_ticket_section(ticket))
@@ -50,8 +51,10 @@ def build_dispatch_prompt(
         sections.append(_pr_section(ticket))
         sections.append(_review_section(config))
 
-    # Memory context
-    if mental_models:
+    # Router-owned Hindsight context
+    if isinstance(hindsight_context, dict) and hindsight_context:
+        sections.append(format_hindsight_context_section(hindsight_context))
+    elif mental_models:
         sections.append(_memory_section(mental_models))
 
     # Workflow instructions
@@ -186,6 +189,15 @@ def _memory_section(models: dict[str, str]) -> str:
     for model_id, content in models.items():
         lines.append(f"### {model_id}")
         lines.append(content)
+    return "\n".join(lines)
+
+
+def format_hindsight_context_section(context: dict[str, str]) -> str:
+    """Render compact router-owned Hindsight context for dispatch payloads."""
+    lines = ["## Hindsight Context"]
+    for label, content in context.items():
+        lines.append(f"### {label}")
+        lines.append(str(content))
     return "\n".join(lines)
 
 

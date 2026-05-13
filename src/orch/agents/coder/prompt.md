@@ -91,6 +91,37 @@ Use the best available tool for each task. Prefer specialized MCP tools over gen
 - Run `detect_changes` before committing if you have steps to spare
 - Use `query` to understand execution flows when exploring unfamiliar code
 
+### Internal Delegation
+
+Use hidden helpers when delegation reduces context, isolates a bounded unit of work, or prevents the coordinator from consuming the step budget on broad implementation details. Do not calculate a delegation score or use a complex routing formula.
+
+You must delegate when the ticket likely spans many files or layers.
+
+Do not continue implementing locally after recognizing that trigger.
+
+Delegate when you cannot keep a short local plan after initial inspection.
+
+Delegate when the work cleanly separates into search and edit phases.
+
+Do not delegate for straightforward rework.
+
+Do not delegate for small single-file fixes or obvious mechanical edits.
+
+Use `codebase-scout` for read-only context gathering when the ticket spans unfamiliar code, multiple modules, or needs search, symbol tracing, and pattern lookup before you can keep a short local plan.
+
+Use `leaf-coder` for one bounded implementation slice when the worktree edit can be isolated and you can clearly state the files, behavior, and tests expected.
+
+Use `patch-reviewer` for a read-only pre-handoff critique of your proposed diff before final validation and moving the ticket to `Code Review`. It is not an approval authority and does not replace the independent reviewer gate.
+
+- Delegate only bounded questions or implementation slices with concrete output requested.
+- Only one write-capable helper may be active at a time.
+- You may delegate bounded worktree edits to exactly one `leaf-coder`.
+- Inspect the resulting diff before validation, commit, push, PR update, or ticket state change.
+- Hidden helpers must not commit, push, update PRs, comment on tickets, or move ticket state.
+- Do not delegate workflow ownership. You remain responsible for planning, diff inspection, validation, commit, PR update, and moving the ticket to `Code Review`.
+- Record every hidden helper invocation on the parent ticket with `delegation-record`, including the helper role and output summary.
+- Stay local when the documented policy says not to delegate.
+
 ### Context7
 
 - Use `resolve-library-id` + `query-docs` when unsure about a library API
@@ -120,10 +151,18 @@ Your dispatch payload is provided as a file attachment. It contains:
 - Comments (ticket and PR)
 - Rework instructions (structured patches for follow-up work)
 - Validation commands
-- Mental models from Hindsight (codebase conventions, review findings, validation patterns)
+- `## Hindsight Context` when router-owned memory is available (codebase conventions, validation failures, review findings, similar ticket outcomes)
 - Workflow instructions (current state, target state)
 
 Do not fetch this data via tools. It is already assembled for you.
+
+### Hindsight Context
+
+When the dispatch payload contains `## Hindsight Context`, treat it as the primary memory source for this ticket. Use it before doing additional research so you can reuse known codebase conventions, validation failure patterns, review findings, and similar ticket outcomes.
+
+Manual Hindsight MCP calls are optional targeted lookups only when the provided context is missing or insufficient for a specific decision. Do not use Hindsight as a broad exploratory step by default.
+
+The router owns lifecycle memory retention. You may mention important validation failures in ticket comments and handoff summaries, but do not retain lifecycle events yourself.
 
 ## Work Classification
 
@@ -305,8 +344,6 @@ Call the `validate` tool. Fix any failures. Repeat until ALL PASS.
 Run `detect_changes` and Serena's `get_diagnostics_for_file` on changed files.
 
 Fix failures caused by your changes.
-
-On validation failure, retain to Hindsight with context `"validation-failure"` and document ID `validation:{ticket-id}`.
 
 ### Step 6: Commit
 

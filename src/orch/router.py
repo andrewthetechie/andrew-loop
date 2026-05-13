@@ -23,6 +23,7 @@ from orch.tickets import (
     get_routable_issue_ids,
     get_ticket,
     get_ticket_comments,
+    list_delegation_context,
     list_tickets,
     ticket_to_dict,
     update_ticket,
@@ -470,23 +471,36 @@ class Router:
             # ticket was "To Do" before we set it to In Progress above — check original
             pass  # state already flipped; check handled below via pre_state tracking
 
-        # Run baseline validation before every coder dispatch (fresh or rework).
-        # If validators fail, the coder can't distinguish its own breakage from
-        # pre-existing failures, so halt and prompt the operator.
+        skip_baseline_validation = (
+            agent_type == "coder"
+            and pre_dispatch_state == "Rework"
+            and await self._is_router_wip_head(ticket_id, worktree_dir)
+        )
+
+        # Run baseline validation before coder dispatch unless this is a Rework
+        # continuation from router-preserved WIP. Router WIP is known partial
+        # coder work, so failing validators are the work to continue from rather
+        # than a clean-baseline blocker.
         if agent_type == "coder" and self._config.validation.commands:
-            val_ok = await self._check_baseline_validation(
-                ticket_id, worktree_dir, self._config.validation.commands
-            )
-            if not val_ok:
-                await update_ticket(self._db, ticket_id, state=pre_dispatch_state)
-                await add_comment(
-                    self._db,
-                    ticket_id,
-                    "Router halted dispatch: baseline validation failed. "
-                    "Fix the failing validators and re-queue the ticket.",
-                    author="router",
+            if skip_baseline_validation:
+                self._log(
+                    f"  [yellow]↷[/yellow] {ticket_id} continuing router WIP"
+                    " — skipping baseline validation"
                 )
-                return
+            else:
+                val_ok = await self._check_baseline_validation(
+                    ticket_id, worktree_dir, self._config.validation.commands
+                )
+                if not val_ok:
+                    await update_ticket(self._db, ticket_id, state=pre_dispatch_state)
+                    await add_comment(
+                        self._db,
+                        ticket_id,
+                        "Router halted dispatch: baseline validation failed. "
+                        "Fix the failing validators and re-queue the ticket.",
+                        author="router",
+                    )
+                    return
 
         if agent_type == "merger":
             review_decision, review_comment = _extract_current_review_decision(comments)
@@ -543,6 +557,28 @@ class Router:
                         " reviewer gate failed → Rework"
                     )
                     return
+
+        if agent_type != "merger" and self._hindsight_client and self._hindsight_bank_id:
+            try:
+                from orch.hindsight import fetch_hindsight_context
+
+                hindsight_context = await fetch_hindsight_context(
+                    self._hindsight_client,
+                    bank_id=self._hindsight_bank_id,
+                    ticket=ticket,
+                    agent_type=agent_type,
+                )
+                if hindsight_context:
+                    dispatch_config["hindsight_context"] = hindsight_context
+                    self._log(
+                        f"  [green]✓[/green] {ticket_id} loaded Hindsight context"
+                        f" ({len(hindsight_context)} sections)"
+                    )
+            except Exception as exc:
+                detail = str(exc) or exc.__class__.__name__
+                self._log(
+                    f"  [yellow]⚠[/yellow] {ticket_id} Hindsight context unavailable: {detail}"
+                )
 
         # Mergeability gate for reviewer — short-circuit if PR has conflicts.
         if agent_type == "reviewer" and ticket.linked_pr:
@@ -673,6 +709,12 @@ class Router:
                 f" exit {exit_code} → [bold]{ticket.state}[/bold]"
             )
 
+        if agent_type == "coder":
+            await self._retain_delegation_summaries(ticket_id)
+
+        if agent_type == "reviewer":
+            await self._retain_review_outcome(ticket_id)
+
         if self._tui:
             self._tui.on_agent_done()
 
@@ -761,7 +803,6 @@ class Router:
         )
         await self._retain_outcome(ticket_id)
 
-
     async def _check_baseline_validation(
         self,
         ticket_id: str,
@@ -833,7 +874,6 @@ class Router:
                         f"  [green]✓ All validators passing — dispatching {ticket_id}[/green]\n"
                     )
                     return True
-
                 self._console.print(
                     f"  [red]Still {len(failures)} failing.[/red]"
                     " Fix and press Enter again, or type 'skip':\n"
@@ -841,6 +881,23 @@ class Router:
         finally:
             if self._tui:
                 self._tui.resume()
+
+    async def _is_router_wip_head(self, ticket_id: str, worktree_dir: Path) -> bool:
+        """Return True when HEAD is the router-preserved WIP commit for this ticket."""
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "log",
+            "-1",
+            "--pretty=%s",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(worktree_dir),
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode != 0:
+            return False
+        subject = stdout.decode(errors="replace").strip()
+        return subject == f"WIP [{ticket_id}]: auto-committed by router before rework rebase"
 
     async def _run_validation(
         self,
@@ -1049,10 +1106,7 @@ class Router:
             logger.exception("Failed to auto-create correct PR for %s", ticket_id)
             return ""
         else:
-            self._log(
-                f"[green]✓[/green] [bold]{ticket_id}[/bold]"
-                f" created correct PR: {new_url}"
-            )
+            self._log(f"[green]✓[/green] [bold]{ticket_id}[/bold] created correct PR: {new_url}")
             return new_url
 
     async def _check_pr_review_state(self, pr_url: str) -> str:
@@ -1252,9 +1306,7 @@ class Router:
                 f" PR base `{pr_base}` ≠ `{expected_base}`"
                 " — closing bad PR and creating correct one"
             )
-            new_pr = await self._fix_pr_base_mismatch(
-                ticket_id, linked_pr, expected_base
-            )
+            new_pr = await self._fix_pr_base_mismatch(ticket_id, linked_pr, expected_base)
             if new_pr:
                 # Re-read the linked_pr for downstream gates
                 linked_pr = new_pr
@@ -1285,8 +1337,7 @@ class Router:
                             "",
                             f"**Result:** PR base branch is `{pr_base}`,"
                             f" expected `{expected_base}`.",
-                            "**Action:** auto-recovery failed. Moved to"
-                            " `Needs Human Review`.",
+                            "**Action:** auto-recovery failed. Moved to `Needs Human Review`.",
                         ]
                     ),
                     author="router",
@@ -1297,9 +1348,7 @@ class Router:
                     f"[red]↑[/red] [bold]{ticket_id}[/bold]"
                     " PR base mismatch auto-recovery failed → Needs Human Review"
                 )
-                await self._fire_webhook(
-                    ticket_id, "Ready to Merge", "Needs Human Review"
-                )
+                await self._fire_webhook(ticket_id, "Ready to Merge", "Needs Human Review")
                 return "rerouted"
 
         comments = await get_ticket_comments(self._db, ticket_id)
@@ -1516,6 +1565,54 @@ class Router:
             ticket_id,
             bank_id=self._hindsight_bank_id,
         )
+
+    async def _retain_review_outcome(self, ticket_id: str) -> None:
+        """Retain the latest reviewer decision as a Hindsight review finding."""
+        if not self._hindsight_client or not self._hindsight_bank_id:
+            return
+        ticket = await get_ticket(self._db, ticket_id)
+        if ticket is None:
+            return
+        comments = await get_ticket_comments(self._db, ticket_id)
+        decision, review_comment = _extract_current_review_decision(comments)
+        if decision == "APPROVED" or not review_comment:
+            return
+        from orch.hindsight import retain_review_finding
+
+        await retain_review_finding(
+            self._hindsight_client,
+            ticket_id,
+            str(getattr(ticket, "title", "")),
+            finding=review_comment,
+            bank_id=self._hindsight_bank_id,
+        )
+
+    async def _retain_delegation_summaries(self, ticket_id: str) -> None:
+        """Retain hidden-helper delegation records as Hindsight learning events."""
+        if not self._hindsight_client or not self._hindsight_bank_id:
+            return
+        ticket = await get_ticket(self._db, ticket_id)
+        if ticket is None:
+            return
+        entries = await list_delegation_context(self._db, ticket_id)
+        if not entries:
+            return
+
+        from orch.hindsight import retain_delegation_summary
+
+        ticket_title = str(getattr(ticket, "title", ""))
+        for entry in entries:
+            helper_role = str(entry.step).removeprefix("delegation:")
+            await retain_delegation_summary(
+                self._hindsight_client,
+                ticket_id,
+                ticket_title,
+                helper_role=helper_role,
+                assigned_slice=ticket_title or "Unknown",
+                output_summary=str(entry.output),
+                usefulness="Unknown; retained from helper output for future pattern extraction.",
+                bank_id=self._hindsight_bank_id,
+            )
 
     async def _fire_webhook(self, ticket_id: str, old_state: str, new_state: str) -> None:
         """Fire webhook through the shared webhook module."""

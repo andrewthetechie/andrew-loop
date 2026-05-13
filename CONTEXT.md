@@ -51,6 +51,42 @@ The `orch` CLI and its components (router, config, PR tools, validation runner).
 **Cost-optimized model**:
 A Qwen-class LLM used for implementation tasks (coder) and constrained judgment tasks (merger scope check). Treated like a talented junior engineer — executes discrete, well-described tasks. Not expected to handle complex reasoning, rebases, or vague instructions.
 
+**Coder-sized ticket**:
+A **Ticket** deliberately scoped so a **Cost-optimized model** can complete it reliably from the **Dispatch payload** without broad planning. Usually covers one behavior, integration seam, or mechanical refactor; touches a small expected file set; has concrete acceptance criteria and validation commands; and avoids open-ended architecture decisions.
+_Avoid_: atomic ticket (too vague), large implementation ticket, subsystem ticket
+
+**Reliability-first decomposition**:
+A decomposition policy that prefers many small, serially executable **Coder-sized tickets** over fewer larger tickets or a highly parallel ticket graph. Long dependency chains are acceptable when they make each individual coder dispatch simpler and more reliable.
+_Avoid_: throughput-first decomposition, parallelism-optimized slicing
+
+**Coordinator-needed ticket**:
+A **Ticket** that is too broad for direct cost-optimized implementation because it requires the **Implementation coordinator** to create a multi-step internal plan, delegate multiple **Leaf coder** slices, or discover major missing integration seams. These should usually be split into separate **Coder-sized tickets** during decomposition.
+_Avoid_: acceptable large ticket, subagent-sized ticket
+
+**Valid-state stopping point**:
+A **Ticket** boundary where completing the ticket leaves the repository in a coherent state with configured validators passing. Decomposition must not create intermediate tickets that knowingly break tests, type checks, builds, migrations, or runtime assumptions until a later ticket fixes them.
+_Avoid_: temporary broken state, follow-up will fix it
+
+**Meaningful intermediate ticket**:
+A **Coder-sized ticket** that prepares later work while still delivering real architecture, compatibility, or user-observable value. It is acceptable only when it creates a **Valid-state stopping point** and is not fake scaffolding invented solely to make decomposition smaller.
+_Avoid_: useless interim work, throwaway scaffold, process-only ticket
+
+**Concrete implementation ticket**:
+A **Coder-sized ticket** whose required task, expected file paths, integration points, acceptance criteria, and validation commands are explicit before the **Router-visible coder** receives it. Codebase discovery and architecture choice belong to decomposition, not to the cost-optimized implementation pass.
+_Avoid_: investigate where to change this, figure out the design, vague implementation ticket
+
+**Pre-create decomposition review**:
+The checkpoint where the **Reasoning-optimized model** presents the proposed **Ticket** graph, dependencies, expected file paths, validator stopping points, and coder-sizing rationale before creating Draft tickets. The human may request splits or adjustments while changes are still cheap.
+_Avoid_: create-first decomposition, hidden ticket graph
+
+**Expected files**:
+The file paths, directories, or path patterns that a **Concrete implementation ticket** expects the **Router-visible coder** to read or modify. Existing files should be named exactly; new files should identify the intended directory, filename when obvious, and nearest existing analog when naming depends on local conventions. Future router behavior may use these paths to pass focused file context into the **Dispatch payload**.
+_Avoid_: find the right place, broad repo exploration
+
+**Codebase-grounded decomposition**:
+A decomposition requirement that the **Reasoning-optimized model** inspects the target repository before proposing tickets, preferably using code intelligence tools such as GitNexus and Serena, so every **Concrete implementation ticket** names realistic **Expected files**, integration points, and local conventions.
+_Avoid_: PRD-only decomposition, placeholder paths
+
 **Reasoning-optimized model**:
 A Claude/GLM-class LLM used for tasks requiring deep reasoning (code review, security review, decomposition). Responsible for producing output that a cost-optimized model can act on mechanically.
 
@@ -113,11 +149,21 @@ _Avoid_: opaque score, premature routing formula
 
 - A **Ticket** has zero or many dependencies on other **Tickets** (DAG, no cycles)
 - A **Ticket** has one **Risk score**
+- Higher **Risk score** implies smaller **Coder-sized tickets** and less bundling of unrelated changes
 - A **Ticket** belongs to one **Review epoch** at a time
 - The **Router** dispatches agents based on **Ticket** state and dependencies
 - The **Router** constructs a **Dispatch payload** for each agent invocation
 - A **Rework instruction** is attached to a **Ticket** by a review agent
 - A **Ticket** belongs to one **PRD** via `issue_id`
+- A **PRD** should decompose into **Coder-sized tickets** even when that creates many dependent **Tickets**
+- **Reliability-first decomposition** allows long dependency chains when serial execution reduces per-ticket complexity
+- **Coordinator-needed tickets** indicate the **PRD** was not decomposed far enough for reliable autonomous implementation
+- Every **Coder-sized ticket** must end at a **Valid-state stopping point**
+- A **Meaningful intermediate ticket** may prepare future work, but decomposition should not create useless interim work just to force smaller slices
+- A **Concrete implementation ticket** gives the **Router-visible coder** explicit files and tasks instead of requiring broad codebase discovery
+- A **Pre-create decomposition review** happens before Draft tickets are created
+- **Expected files** guide both human review of tickets and future router context selection for the **Dispatch payload**
+- **Codebase-grounded decomposition** is required before proposing **Concrete implementation tickets**
 - All ticket PRs target the **Feature branch** derived from the ticket's **PRD**
 - The **Router** in **Issue mode** scopes work to one **PRD**'s tickets at a time
 - The **Independent review gate** sits between `Code Review` and `Ready to Merge`

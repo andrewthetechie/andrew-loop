@@ -6,6 +6,7 @@ import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import click
 import yaml
@@ -37,6 +38,7 @@ from orch.tickets import (
     move_ticket,
     parse_ticket_yaml,
     promote_tickets,
+    record_delegation_output,
     remove_dependencies,
     ticket_to_dict,
     ticket_to_yaml,
@@ -62,6 +64,27 @@ test_expectations: null
 risk_score: null
 issue_id: null
 """
+
+
+class HindsightNotConfiguredError(click.ClickException):
+    """Raised when a Hindsight command needs missing configuration."""
+
+    def __init__(self) -> None:
+        super().__init__("Hindsight is not configured for this repo.")
+
+
+class HindsightResetFailedError(click.ClickException):
+    """Raised when explicit Hindsight reset fails."""
+
+    def __init__(self, bank_id: str) -> None:
+        super().__init__(f"Failed to reset Hindsight bank {bank_id}.")
+
+
+class HindsightScopeError(click.ClickException):
+    """Raised when a Hindsight command receives an invalid scope."""
+
+    def __init__(self) -> None:
+        super().__init__("Use --issue or --ticket, not both.")
 
 
 def _run(coro: object) -> object:
@@ -104,9 +127,17 @@ def _extract_issue_number(output: str) -> int:
     return int(match.group(1))
 
 
-def _build_decompose_dispatch_payload(prd_body: str, issue_id: int, feature_branch: str) -> str:
+def _build_decompose_dispatch_payload(
+    prd_body: str,
+    issue_id: int,
+    feature_branch: str,
+    *,
+    hindsight_context: dict[str, str] | None = None,
+) -> str:
     """Build the prompt payload for the decomposer agent."""
-    return (
+    from orch.prompt import format_hindsight_context_section
+
+    payload = (
         "DECOMPOSER DISPATCH\n\n"
         f"Issue ID: {issue_id}\n"
         f"Feature branch: {feature_branch}\n\n"
@@ -115,6 +146,9 @@ def _build_decompose_dispatch_payload(prd_body: str, issue_id: int, feature_bran
         "PRD:\n\n"
         f"{prd_body}"
     )
+    if hindsight_context:
+        payload += "\n\n" + format_hindsight_context_section(hindsight_context)
+    return payload
 
 
 async def _run_decompose_cmd(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
@@ -269,6 +303,87 @@ def doctor(target_dir: str, no_tools: bool) -> None:
             sys.exit(1)
 
     _run(_doctor())
+
+
+def _configured_hindsight_bank(repo_root: Path) -> tuple[Config, str]:
+    """Return loaded config and resolved project Hindsight bank ID."""
+    cfg = Config.load(repo_root=repo_root)
+    if not cfg.hindsight.url or not cfg.hindsight.bank_id:
+        raise HindsightNotConfiguredError
+    return cfg, f"{cfg.hindsight.bank_id}-{repo_root.name}"
+
+
+@main.group("hindsight")
+def hindsight_cmd() -> None:
+    """Manage Hindsight memory bank operations."""
+
+
+@hindsight_cmd.command("reset")
+@click.option("--force", is_flag=True, help="Skip confirmation prompt.")
+def hindsight_reset(force: bool) -> None:
+    """Explicitly delete and recreate the configured Hindsight bank."""
+    repo_root = Path.cwd()
+    cfg, bank_id = _configured_hindsight_bank(repo_root)
+
+    if not force:
+        click.confirm(
+            f"Reset Hindsight bank {bank_id}?\n"
+            "  This deletes the bank and recreates orch mental models/config.",
+            abort=True,
+        )
+
+    async def _reset() -> None:
+        from orch.hindsight import reset_hindsight_bank
+
+        result = await reset_hindsight_bank(
+            cfg.hindsight.url,
+            bank_id,
+            cfg.hindsight.api_key,
+        )
+        if result.status == "failed":
+            raise HindsightResetFailedError(bank_id)
+        click.echo(f"Hindsight reset complete for {bank_id}")
+
+    _run(_reset())
+
+
+@hindsight_cmd.command("backfill")
+@click.option("--issue", "issue_id", type=int, help="Backfill only tickets for this issue.")
+@click.option("--ticket", "ticket_id", help="Backfill only this ticket.")
+@click.pass_context
+def hindsight_backfill(ctx: click.Context, issue_id: int | None, ticket_id: str | None) -> None:
+    """Backfill curated lifecycle learning events into Hindsight."""
+    repo_root = Path.cwd()
+    cfg, bank_id = _configured_hindsight_bank(repo_root)
+    if issue_id is not None and ticket_id is not None:
+        raise HindsightScopeError
+
+    async def _backfill() -> None:
+        from hindsight_client import Hindsight
+
+        from orch.hindsight import backfill_hindsight
+
+        client = Hindsight(
+            base_url=cfg.hindsight.url,
+            api_key=cfg.hindsight.api_key or None,
+        )
+        try:
+            async with Database(Path(ctx.obj["db_path"])) as db:
+                count = await backfill_hindsight(
+                    client,
+                    db,
+                    bank_id=bank_id,
+                    issue_id=issue_id,
+                    ticket_id=ticket_id,
+                )
+        finally:
+            if hasattr(client, "aclose"):
+                await client.aclose()
+
+        suffix = "" if count == 1 else "s"
+        click.echo(f"Backfilled {count} Hindsight event{suffix} into {bank_id}")
+
+    _run(_backfill())
 
 
 @main.group()
@@ -686,6 +801,32 @@ def comment(ctx: click.Context, ticket_id: str, body: str, author: str) -> None:
     _run(_comment())
 
 
+@tickets.command("delegation-record")
+@click.argument("ticket_id")
+@click.argument("helper_role")
+@click.argument("output")
+@click.pass_context
+def delegation_record(ctx: click.Context, ticket_id: str, helper_role: str, output: str) -> None:
+    """Record hidden-helper output for parent-ticket observability."""
+
+    async def _record() -> None:
+        db_path = ctx.obj["db_path"]
+        async with Database(Path(db_path)) as db:
+            try:
+                await record_delegation_output(
+                    db,
+                    ticket_id,
+                    helper_role=helper_role,
+                    output=output,
+                )
+                click.echo(f"Recorded {helper_role} delegation output for {ticket_id}")
+            except ValueError as e:
+                click.echo(f"Error: {e}", err=True)
+                sys.exit(1)
+
+    _run(_record())
+
+
 @tickets.command("import")
 @click.argument("file", type=click.Path(exists=True))
 @click.pass_context
@@ -974,7 +1115,46 @@ def decompose_cmd(prd_path: Path, issue_id: int | None, no_active: bool) -> None
         if not no_active:
             orch_state.write_active_issue(repo_root, created_issue, base_dir=cfg.state.base_dir)
 
-        payload = _build_decompose_dispatch_payload(prd_body, created_issue, feature_branch)
+        hindsight_context: dict[str, str] = {}
+        if cfg.hindsight.url and cfg.hindsight.bank_id:
+            hindsight_client = None
+            try:
+                from hindsight_client import Hindsight
+
+                from orch.hindsight import fetch_hindsight_context
+
+                hindsight_client = Hindsight(
+                    base_url=cfg.hindsight.url,
+                    api_key=cfg.hindsight.api_key or None,
+                )
+                bank_id = f"{cfg.hindsight.bank_id}-{repo_root.name}"
+                hindsight_context = await fetch_hindsight_context(
+                    hindsight_client,
+                    bank_id=bank_id,
+                    ticket=SimpleNamespace(
+                        title=title,
+                        state="Decompose",
+                        risk_score="-",
+                        description=prd_body,
+                        file_paths="",
+                        test_expectations="",
+                    ),
+                    agent_type="decomposer",
+                )
+                if hindsight_context:
+                    _info(f"✓ Loaded Hindsight context ({len(hindsight_context)} sections)")
+            except Exception as exc:
+                _warn(f"Hindsight context unavailable: {exc}")
+            finally:
+                if hindsight_client and hasattr(hindsight_client, "aclose"):
+                    await hindsight_client.aclose()
+
+        payload = _build_decompose_dispatch_payload(
+            prd_body,
+            created_issue,
+            feature_branch,
+            hindsight_context=hindsight_context,
+        )
         dispatch_file = repo_root / DECOMPOSE_DISPATCH_FILE
         await asyncio.to_thread(dispatch_file.write_text, payload)
         _info(f"✓ Dispatch payload written to {DECOMPOSE_DISPATCH_FILE}")

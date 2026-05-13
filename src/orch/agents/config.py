@@ -22,6 +22,7 @@ class AgentConfig(BaseModel):
     name: str
     description: str
     mode: str = "primary"
+    hidden: bool = False
     temperature: float = 0.1
     steps: int = 50
     prompt_file: str = ""
@@ -35,6 +36,8 @@ class AgentConfig(BaseModel):
             "temperature": self.temperature,
             "steps": self.steps,
         }
+        if self.hidden:
+            result["hidden"] = True
         if self.prompt_file:
             result["prompt"] = f"{{file:./.opencode/prompts/{self.prompt_file}}}"
         if self.permission:
@@ -90,7 +93,7 @@ def coder_agent_config() -> AgentConfig:
         description="Implements tickets using test-first development",
         mode="primary",
         temperature=0.1,
-        steps=60,
+        steps=90,
         prompt_file="coder.md",
         permission={
             "edit": "allow",
@@ -99,13 +102,19 @@ def coder_agent_config() -> AgentConfig:
             "glob": "allow",
             "grep": "allow",
             "list": "allow",
-            "task": "deny",
+            "task": {
+                "*": "deny",
+                "codebase-scout": "allow",
+                "leaf-coder": "allow",
+                "patch-reviewer": "allow",
+            },
             "websearch": "deny",
             "webfetch": "deny",
             "ticket-read": "allow",
             "ticket-update": "allow",
             "ticket-comment": "allow",
             "ticket-list": "allow",
+            "delegation-record": "allow",
             "serena_*": "allow",
             "gitnexus_*": "allow",
             "context7_*": "allow",
@@ -207,12 +216,127 @@ def decomposer_agent_config() -> AgentConfig:
     )
 
 
-KNOWN_AGENTS: list[AgentConfig] = [
+def leaf_coder_agent_config() -> AgentConfig:
+    """Factory for the internal leaf-coder helper config."""
+    return AgentConfig(
+        name="leaf-coder",
+        description="Internal hidden helper that implements one bounded code slice",
+        mode="subagent",
+        hidden=True,
+        temperature=0.1,
+        steps=45,
+        prompt_file="leaf-coder.md",
+        permission={
+            "edit": "allow",
+            "bash": "deny",
+            "read": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "list": "allow",
+            "task": "deny",
+            "websearch": "deny",
+            "webfetch": "deny",
+            "ticket-read": "deny",
+            "ticket-update": "deny",
+            "ticket-comment": "deny",
+            "ticket-list": "deny",
+            "delegation-record": "deny",
+            "pr-create": "deny",
+            "pr-update": "deny",
+            "pr-status": "deny",
+            "pr-merge": "deny",
+            "serena_*": "allow",
+            "gitnexus_*": "allow",
+            "context7_*": "allow",
+        },
+    )
+
+
+def codebase_scout_agent_config() -> AgentConfig:
+    """Factory for the internal codebase-scout helper config."""
+    return AgentConfig(
+        name="codebase-scout",
+        description="Internal hidden helper that gathers codebase context without editing",
+        mode="subagent",
+        hidden=True,
+        temperature=0.1,
+        steps=30,
+        prompt_file="codebase-scout.md",
+        permission={
+            "read": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "list": "allow",
+            "edit": "deny",
+            "bash": "deny",
+            "task": "deny",
+            "websearch": "deny",
+            "webfetch": "deny",
+            "ticket-read": "deny",
+            "ticket-update": "deny",
+            "ticket-comment": "deny",
+            "ticket-list": "deny",
+            "delegation-record": "deny",
+            "pr-create": "deny",
+            "pr-update": "deny",
+            "pr-status": "deny",
+            "pr-merge": "deny",
+            "serena_*": "allow",
+            "gitnexus_*": "allow",
+            "context7_*": "allow",
+        },
+    )
+
+
+def patch_reviewer_agent_config() -> AgentConfig:
+    """Factory for the internal patch-reviewer helper config."""
+    return AgentConfig(
+        name="patch-reviewer",
+        description="Internal hidden helper that critiques diffs before external review",
+        mode="subagent",
+        hidden=True,
+        temperature=0.2,
+        steps=30,
+        prompt_file="patch-reviewer.md",
+        permission={
+            "read": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "list": "allow",
+            "edit": "deny",
+            "bash": "deny",
+            "task": "deny",
+            "websearch": "deny",
+            "webfetch": "deny",
+            "ticket-read": "deny",
+            "ticket-update": "deny",
+            "ticket-comment": "deny",
+            "ticket-list": "deny",
+            "delegation-record": "deny",
+            "pr-create": "deny",
+            "pr-update": "deny",
+            "pr-status": "deny",
+            "pr-merge": "deny",
+            "serena_*": "allow",
+            "gitnexus_*": "allow",
+        },
+    )
+
+
+VISIBLE_AGENTS: list[AgentConfig] = [
     coder_agent_config(),
     reviewer_agent_config(),
     merger_agent_config(),
     decomposer_agent_config(),
 ]
+
+HIDDEN_HELPER_AGENTS: list[AgentConfig] = [
+    leaf_coder_agent_config(),
+    codebase_scout_agent_config(),
+    patch_reviewer_agent_config(),
+]
+
+KNOWN_AGENTS: list[AgentConfig] = [*VISIBLE_AGENTS, *HIDDEN_HELPER_AGENTS]
 
 
 def compile_all_agents(
@@ -220,11 +344,16 @@ def compile_all_agents(
 ) -> dict[str, dict[str, Any]]:
     """Compile all known agents with models from orch config.
 
-    Only includes agents that have a model configured.
+    Visible agents use their own configured model. Hidden implementation
+    helpers inherit the coder model so they can be installed without becoming
+    router-visible roles in orch config.
     """
     result: dict[str, dict[str, Any]] = {}
+    helper_model = agent_models.get("coder")
     for agent in KNOWN_AGENTS:
         model = agent_models.get(agent.name)
+        if model is None and agent.hidden:
+            model = helper_model
         if model:
             result[agent.name] = compile_agent(agent, model=model)
     return result

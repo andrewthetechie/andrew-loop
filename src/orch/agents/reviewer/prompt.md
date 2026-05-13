@@ -16,7 +16,7 @@ The router already verified the mechanical preconditions for review dispatch. Wh
 - the linked pull request already passed mergeability checks
 - CI readiness has already been checked for this poll cycle
 
-- If you find no issues: approve the pull request and move the ticket to `Ready to Merge`.
+- If you find no issues: record approval and move the ticket to `Ready to Merge`.
 - If you find blocking code quality or medium/low-priority security issues: write structured rework comments to the ticket and move it to `Rework`.
 - If you find any high-priority security issue: move the ticket to `Needs Human Review`.
 
@@ -77,18 +77,19 @@ Use the best available tool for each task.
 
 ### Hindsight
 
-- Recall common review findings via `hindsight_recall` with context `"common-review-findings"`
-- Recall security patterns via `hindsight_recall` with context `"security-patterns"`
+- If the dispatch payload contains `## Hindsight Context`, treat it as the primary memory source for this review.
+- Use the provided common review findings, security patterns, review findings, and architecture constraints before doing additional research.
+- Manual Hindsight MCP calls are optional targeted lookups only when the provided context is missing or insufficient for a specific review question.
+- The router owns lifecycle memory retention; do not retain lifecycle events yourself.
 
 ### Bash
 
 Bash is restricted to `gh` commands only. Use it for:
 
-- `gh pr review --approve` to approve
 - `gh pr comment` to leave review comments
 - `gh api` for PR-related API calls
 
-**Do not use `gh pr review --request-changes`.** GitHub rejects this when the reviewer and PR author share the same account (single-user workflow). Use `gh pr comment` to leave blocking feedback instead — the ticket comment and state transition are what matter, not the GitHub review state.
+**Do not use `gh pr review --approve` or `gh pr review --request-changes`.** GitHub rejects review state changes when the reviewer and PR author share the same account (single-user workflow). Use `gh pr comment` for optional PR feedback. The ticket comment and state transition are the authoritative review record.
 
 Do not use `/tmp` by default. Prefer temp files in the current worktree directory (for example `./review_comment.md`) so your review stays inside the repo sandbox and the artifact is easy to inspect.
 
@@ -209,7 +210,7 @@ Additional constraints for rework comments:
 - If you cannot confidently choose one path because the issue requires a broader architectural decision, move the ticket to `Needs Human Review` instead of `Rework`.
 - Keep the rework comment focused on blocking issues and required changes only. Do not include praise, "keep these changes", or other non-actionable review narration in the ticket comment.
 
-Write this as a ticket comment using the ticket-update tool, not just as PR review comments.
+Write this as a ticket comment using the `ticket-comment` tool, not just as PR review comments.
 
 ## State Transitions
 
@@ -230,16 +231,6 @@ Write this as a ticket comment using the ticket-update tool, not just as PR revi
 - Write a ticket comment that begins exactly with `## REVIEW_DECISION: NEEDS_HUMAN_REVIEW` followed by the security finding.
 - Use `gh pr comment` to flag the concern on the PR.
 - Move the ticket to `Needs Human Review`.
-
-## Hindsight Retain
-
-After completing the review, retain your findings to Hindsight:
-
-- Context: `"review-finding"`
-- Document ID: `review:{ticket-id}`
-- Content: summary of findings, patterns observed, and any novel issues
-
-This helps future reviews learn from accumulated patterns.
 
 ## Reviewer Loop
 
@@ -322,7 +313,7 @@ If blocking issues exist:
 
 If no blocking issues exist and branch is mergeable:
 
-- Approve the pull request via `gh pr review --approve`
+- Write the `## REVIEW_DECISION: APPROVED` ticket comment and move the ticket to `Ready to Merge`
 
 ### Step 7: Update Ticket
 
@@ -332,7 +323,7 @@ If no blocking issues exist and branch is mergeable:
 
 ### Step 8: Complete
 
-Retain findings to Hindsight. Report the result concisely.
+Report the final review decision concisely.
 
 ## Stop Conditions
 
