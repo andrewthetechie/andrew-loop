@@ -13,6 +13,7 @@ import threading
 import tty
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -58,6 +59,23 @@ _BAR_WIDTH = 20
 _ABSOLUTE_PATH_RE = re.compile(r"/[^\s<>]+(?:/[^\s<>]+)+")
 
 
+@dataclass
+class _ActiveDispatch:
+    ticket_id: str
+    ticket_title: str
+    ticket_state: str
+    logical_agent: str
+    model: str
+    step_budget: int
+    dispatch_start: datetime
+    step: int = 0
+    last_tool: str = "—"
+    backend_id: str = ""
+    physical_alias: str = ""
+    step_reserve: int | None = None
+    status: str = "dispatching"
+
+
 def _context_limit(model: str) -> int:
     low = model.lower()
     for fragment, limit in _CONTEXT_LIMITS:
@@ -93,9 +111,12 @@ class RouterTUI:
         self._live: Live | None = None
         self._log: deque[Text] = deque(maxlen=self.MAX_LOG_LINES)
         self._agent_text: deque[Text] = deque(maxlen=self.MAX_LOG_LINES)
+        self._dispatch_agent_text: dict[str, deque[Text]] = {}
         self._event_log_scroll_offset = 0
         self._keyboard_stop = threading.Event()
         self._keyboard_thread: threading.Thread | None = None
+        self._active_dispatches: dict[str, _ActiveDispatch] = {}
+        self._selected_dispatch_ticket_id: str | None = None
 
         # Ticket state
         self._ticket_id: str = "—"
@@ -175,7 +196,26 @@ class RouterTUI:
         dependencies: list[str] | None = None,
         model: str = "",
         step_budget: int = 50,
+        backend_id: str = "",
+        physical_alias: str = "",
+        step_reserve: int | None = None,
     ) -> None:
+        dispatch = _ActiveDispatch(
+            ticket_id=ticket_id,
+            ticket_title=ticket_title,
+            ticket_state=ticket_state,
+            logical_agent=agent_type,
+            model=model or "—",
+            step_budget=step_budget,
+            dispatch_start=datetime.now(),
+            backend_id=backend_id,
+            physical_alias=physical_alias,
+            step_reserve=step_reserve,
+        )
+        self._active_dispatches[ticket_id] = dispatch
+        self._dispatch_agent_text.setdefault(ticket_id, deque(maxlen=self.MAX_LOG_LINES))
+        self._selected_dispatch_ticket_id = ticket_id
+
         self._ticket_id = ticket_id
         self._ticket_title = ticket_title
         self._ticket_state = ticket_state
@@ -206,18 +246,47 @@ class RouterTUI:
 
     def set_ticket_state(self, state: str) -> None:
         self._ticket_state = state
+        active = self._active_dispatches.get(self._ticket_id)
+        if active is not None:
+            active.ticket_state = state
+            active.status = state
         self._issue_tickets = [
             (ticket_id, state if ticket_id == self._ticket_id else ticket_state)
             for ticket_id, ticket_state in self._issue_tickets
         ]
         self._refresh()
 
-    def on_agent_done(self) -> None:
+    def set_dispatch_waiting_for_helper(self, ticket_id: str, helper_role: str) -> None:
+        """Mark an active dispatch as waiting for a hidden-helper slot.
+
+        Updates the dispatch status so the Active Dispatch view shows
+        "waiting for hidden-helper slot" instead of the default status.
+        This prevents operators from mistaking the wait for a hang.
+        """
+        active = self._active_dispatches.get(ticket_id)
+        if active is None:
+            return
+        active.status = "waiting for hidden-helper slot"
+        self._refresh()
+
+    def select_next_dispatch(self) -> None:
+        self._cycle_selected_dispatch(1)
+
+    def select_previous_dispatch(self) -> None:
+        self._cycle_selected_dispatch(-1)
+
+    def on_agent_done(self, ticket_id: str | None = None) -> None:
+        completed_ticket_id = ticket_id or self._ticket_id
+        self._active_dispatches.pop(completed_ticket_id, None)
+        self._dispatch_agent_text.pop(completed_ticket_id, None)
+        if self._selected_dispatch_ticket_id == completed_ticket_id:
+            self._selected_dispatch_ticket_id = next(iter(self._active_dispatches), None)
         self._stage = "polling"
         self._agent_type = "—"
         self._agent_model = "—"
         self._context_used = 0
-        self._agent_text.clear()
+        if not self._active_dispatches:
+            self._agent_text.clear()
         self._stage_start = None
         self._dispatch_start = None
         self._refresh()
@@ -269,6 +338,8 @@ class RouterTUI:
         text = raw.decode("utf-8", errors="replace").strip()
         if not text:
             return
+        dispatch = self._active_dispatches.get(ticket_id)
+        prefix = self._dispatch_log_prefix(ticket_id, dispatch)
         try:
             data: dict[str, Any] = json.loads(text)
         except json.JSONDecodeError:
@@ -279,9 +350,13 @@ class RouterTUI:
         part = data.get("part", {})
 
         if event_type == "step_start":
-            self._step += 1
-            self.set_stage(f"step {self._step}")
-            self.log(f"[bold cyan]{ticket_id}[/bold cyan] step {self._step}")
+            if dispatch is not None:
+                dispatch.step += 1
+                dispatch.status = f"step {dispatch.step}"
+            current_step = dispatch.step if dispatch is not None else self._step + 1
+            self._step = current_step
+            self.set_stage(f"step {current_step}")
+            self.log(f"{prefix} step {current_step}")
 
         elif event_type == "step_finish":
             session_id = data.get("sessionID", "")
@@ -304,7 +379,7 @@ class RouterTUI:
                 self._total_cost += cost
             self._refresh()
             self.log(
-                f"  step {self._step} done  "
+                f"{prefix} step {self._step} done  "
                 f"[dim]tokens={total_tok}  cost={cost_str}  reason={reason}[/dim]"
             )
 
@@ -312,6 +387,7 @@ class RouterTUI:
             agent_text = part.get("text", "").strip()
             if not agent_text:
                 return
+            stream = self._agent_stream_for_ticket(ticket_id)
             for line in agent_text.splitlines():
                 stripped = line.strip()
                 if not stripped:
@@ -319,9 +395,9 @@ class RouterTUI:
                 if "LOOP STATE:" in stripped:
                     stage = stripped.split("LOOP STATE:", 1)[-1].strip().strip("`").strip()
                     self.set_stage(stage)
-                    self.log(f"  [bold]{stripped}[/bold]")
+                    self.log(f"{prefix} [bold]{stripped}[/bold]")
                 else:
-                    self._agent_text.append(Text(stripped[:120], style="italic"))
+                    stream.append(Text(stripped[:120], style="italic"))
                     self._refresh()
 
         elif event_type == "tool_use":
@@ -330,22 +406,26 @@ class RouterTUI:
             status = state.get("status", "?")
             inp = state.get("input", {})
             if self._is_task_tool(tool):
-                self._log_task_tool_event(tool, status, inp, state)
+                self._log_task_tool_event(ticket_id, prefix, tool, status, inp, state)
                 self._refresh()
                 return
 
+            if dispatch is not None:
+                dispatch.last_tool = tool
             self._last_tool = tool
             brief = self._tool_brief(tool, inp)
 
             if status == "completed":
                 output_raw = str(state.get("output", ""))
                 output = self._compact_log_fragment(output_raw, max_chars=80)
-                self.log(f"  [green]✓[/green] [cyan]{tool}[/cyan]{brief}  [dim]{output}[/dim]")
+                self.log(
+                    f"{prefix} [green]✓[/green] [cyan]{tool}[/cyan]{brief}  [dim]{output}[/dim]"
+                )
             elif status == "error":
                 err = self._compact_log_fragment(str(state.get("error", "")), max_chars=80)
-                self.log(f"  [red]✗[/red] [cyan]{tool}[/cyan]{brief}  [red]{err}[/red]")
+                self.log(f"{prefix} [red]✗[/red] [cyan]{tool}[/cyan]{brief}  [red]{err}[/red]")
             else:
-                self.log(f"  [yellow]...[/yellow] [cyan]{tool}[/cyan]{brief}")
+                self.log(f"{prefix} [yellow]...[/yellow] [cyan]{tool}[/cyan]{brief}")
 
             self._refresh()
 
@@ -353,6 +433,8 @@ class RouterTUI:
 
     def _log_task_tool_event(
         self,
+        ticket_id: str,
+        prefix: str,
         tool: str,
         status: str,
         inp: dict[str, Any],
@@ -362,27 +444,43 @@ class RouterTUI:
         task = self._task_description(inp)
         task_suffix = f": {escape(task)}" if task else ""
         self._last_tool = f"{tool}:{helper}"
+        stream_lines = self._agent_stream_for_ticket(ticket_id)
 
         if status == "completed":
             output = self._compact_log_fragment(str(state.get("output", "")), max_chars=80)
-            self.log(f"  [green]✓[/green] [cyan]{helper} done[/cyan]  [dim]{escape(output)}[/dim]")
-            stream = f"{helper} finished"
+            self.log(
+                f"{prefix} [green]✓[/green] [cyan]{helper} done[/cyan]  "
+                f"[dim]{escape(output)}[/dim]"
+            )
+            stream_message = f"{helper} finished"
             if output:
-                stream += f": {output}"
-            self._agent_text.append(Text(stream[:120], style="italic"))
+                stream_message += f": {output}"
+            stream_lines.append(Text(stream_message[:120], style="italic"))
         elif status == "error":
             err = self._compact_log_fragment(str(state.get("error", "")), max_chars=80)
-            self.log(f"  [red]✗[/red] [cyan]{helper} failed[/cyan]  [red]{escape(err)}[/red]")
-            stream = f"{helper} failed"
+            self.log(
+                f"{prefix} [red]✗[/red] [cyan]{helper} failed[/cyan]  [red]{escape(err)}[/red]"
+            )
+            stream_message = f"{helper} failed"
             if err:
-                stream += f": {err}"
-            self._agent_text.append(Text(stream[:120], style="italic red"))
+                stream_message += f": {err}"
+            stream_lines.append(Text(stream_message[:120], style="italic red"))
         else:
-            self.log(f"  [yellow]...[/yellow] [cyan]{helper} working[/cyan]{task_suffix}")
-            stream = f"{helper} working"
+            self.log(f"{prefix} [yellow]...[/yellow] [cyan]{helper} working[/cyan]{task_suffix}")
+            stream_message = f"{helper} working"
             if task:
-                stream += f": {task}"
-            self._agent_text.append(Text(stream[:120], style="italic"))
+                stream_message += f": {task}"
+            stream_lines.append(Text(stream_message[:120], style="italic"))
+
+    @staticmethod
+    def _dispatch_log_prefix(ticket_id: str, dispatch: _ActiveDispatch | None) -> str:
+        prefix = f"[bold cyan]{ticket_id}[/bold cyan]"
+        if dispatch is None or not dispatch.backend_id:
+            return prefix
+        worker = dispatch.physical_alias or dispatch.model
+        if worker:
+            return f"{prefix} [dim]({dispatch.backend_id} / {escape(worker)})[/dim]"
+        return f"{prefix} [dim]({dispatch.backend_id})[/dim]"
 
     @staticmethod
     def _is_task_tool(tool: str) -> bool:
@@ -478,7 +576,38 @@ class RouterTUI:
         t.add_row("Stage runtime", self._elapsed(self._stage_start))
         t.add_row("Agent runtime", self._elapsed(self._dispatch_start))
         t.add_row("Total runtime", self._elapsed(self._router_start))
-        return Panel(t, title="[bold]Router Info[/bold]", border_style="blue")
+
+        body: Group | Table = t
+        if self._active_dispatches:
+            active = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+            active.add_column("Ticket", no_wrap=True)
+            active.add_column("Agent", no_wrap=True)
+            active.add_column("Backend", no_wrap=True)
+            active.add_column("Worker", overflow="ellipsis", ratio=1)
+            active.add_column("Steps", no_wrap=True)
+            active.add_column("Runtime", no_wrap=True)
+            active.add_column("Last Tool", overflow="ellipsis", ratio=1)
+            active.add_column("Status", overflow="ellipsis", ratio=1)
+            for dispatch in self._active_dispatches.values():
+                worker = dispatch.physical_alias or dispatch.model
+                step_usage = (
+                    f"{dispatch.step}/{dispatch.step_reserve}"
+                    if dispatch.step_reserve is not None
+                    else str(dispatch.step)
+                )
+                active.add_row(
+                    dispatch.ticket_id,
+                    dispatch.logical_agent,
+                    dispatch.backend_id or "—",
+                    worker,
+                    step_usage,
+                    self._elapsed(dispatch.dispatch_start),
+                    dispatch.last_tool,
+                    dispatch.status,
+                )
+            body = Group(t, Rule("[bold]Active Dispatches[/bold]", style="blue"), active)
+
+        return Panel(body, title="[bold]Router Info[/bold]", border_style="blue")
 
     def _render_agent_info(self) -> Panel:
         t = Table.grid(padding=(0, 2))
@@ -558,9 +687,13 @@ class RouterTUI:
         )
 
     def _render_agent_stream(self) -> Panel:
+        selected_ticket_id = self._selected_dispatch_ticket_id
+        title = "[bold]Agent Stream[/bold]"
+        if selected_ticket_id is not None:
+            title += f" [dim]({selected_ticket_id})[/dim]"
         return Panel(
-            self._tail_lines(self._agent_text),
-            title="[bold]Agent Stream[/bold]",
+            self._tail_lines(self._selected_agent_stream()),
+            title=title,
             border_style="dim",
             padding=(0, 1),
         )
@@ -624,6 +757,36 @@ class RouterTUI:
             self.scroll_event_log_to_oldest()
         elif key in ("G", "\x1b[F", "\x1b[4~"):
             self.scroll_event_log_to_latest()
+        elif key == "\t":
+            self.select_next_dispatch()
+        elif key == "\x1b[Z":
+            self.select_previous_dispatch()
+
+    def _cycle_selected_dispatch(self, direction: int) -> None:
+        ticket_ids = list(self._active_dispatches)
+        if len(ticket_ids) < 2:
+            return
+        selected_ticket_id = self._selected_dispatch_ticket_id
+        if selected_ticket_id not in ticket_ids:
+            self._selected_dispatch_ticket_id = ticket_ids[0]
+            self._refresh()
+            return
+        current_index = ticket_ids.index(selected_ticket_id)
+        self._selected_dispatch_ticket_id = ticket_ids[
+            (current_index + direction) % len(ticket_ids)
+        ]
+        self._refresh()
+
+    def _agent_stream_for_ticket(self, ticket_id: str | None) -> deque[Text]:
+        if ticket_id is None or ticket_id not in self._active_dispatches:
+            return self._agent_text
+        return self._dispatch_agent_text.setdefault(
+            ticket_id,
+            deque(maxlen=self.MAX_LOG_LINES),
+        )
+
+    def _selected_agent_stream(self) -> deque[Text]:
+        return self._agent_stream_for_ticket(self._selected_dispatch_ticket_id)
 
     @staticmethod
     def _elapsed(start: datetime | None) -> str:

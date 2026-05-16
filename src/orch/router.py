@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from rich.console import Console
 
+from orch.backend_allocator import BackendAllocation, BackendAllocator, BackendNoCapacity
+from orch.backend_failures import (
+    AgentRunResult,
+    classify_backend_failure,
+    offline_cooldown_seconds,
+)
+from orch.backend_state import BackendStateStore
+from orch.backends import BackendDefinition, load_configured_backends
 from orch.config import Config
 from orch.db import Database, Event
+from orch.dispatch_pruning import prune_dispatch_payload
+from orch.gates import build_patch_review_context, check_patch_review_handoff_gate
+from orch.hidden_helper_semaphore import HiddenHelperSemaphorePool
 from orch.hindsight import retain_human_intervention, retain_ticket_outcome
 from orch.prompt import build_dispatch_prompt
 from orch.state import resolve_state_dir
@@ -20,6 +32,7 @@ from orch.tickets import (
     add_comment,
     get_dependencies,
     get_next_routable,
+    get_routable_batch,
     get_routable_issue_ids,
     get_ticket,
     get_ticket_comments,
@@ -34,7 +47,7 @@ from orch.webhook import fire_webhook
 logger = logging.getLogger(__name__)
 
 CreateWorktree = Callable[[str, str, Path, str], Awaitable[None]]
-RunAgent = Callable[[str, Path, str, str], Awaitable[int]]  # ticket_id, dir, agent_type, payload
+RunAgent = Callable[[str, Path, str, str], Awaitable[int | AgentRunResult]]
 WebhookPost = Callable[..., Awaitable[int]]
 
 AGENT_FOR_STATE: dict[str, str] = {
@@ -45,6 +58,7 @@ AGENT_FOR_STATE: dict[str, str] = {
 }
 
 ROUTABLE_STATES = tuple(AGENT_FOR_STATE.keys())
+CODER_ROUTABLE_STATES = ("To Do", "Rework")
 
 
 def feature_branch_name(issue_id: int | None) -> str:
@@ -57,7 +71,6 @@ def feature_branch_name(issue_id: int | None) -> str:
     return "main"
 
 
-MAX_REWORK_LOOPS = 3
 _REVIEW_DECISION_PREFIX = "## REVIEW_DECISION:"
 _PENDING_CHECK_STATES = {"EXPECTED", "IN_PROGRESS", "PENDING", "QUEUED", "REQUESTED", "WAITING"}
 _FAILING_CHECK_STATES = {
@@ -163,9 +176,10 @@ def _classify_status_check_rollup(rollup: list[object]) -> str:
     return "passed"
 
 
-def _sum_step_finish_total_tokens(output: bytes) -> int:
-    """Sum `tokens.total` across all step_finish events in opencode stdout."""
-    total = 0
+def _summarize_step_finish_usage(output: bytes) -> tuple[int, int]:
+    """Return completed step count and total tokens from step_finish events."""
+    steps = 0
+    total_tokens = 0
     for raw_line in output.decode("utf-8", errors="replace").splitlines():
         line = raw_line.strip()
         if not line:
@@ -176,12 +190,44 @@ def _sum_step_finish_total_tokens(output: bytes) -> int:
             continue
         if data.get("type") != "step_finish":
             continue
+        steps += 1
         part = data.get("part", {})
         tokens = part.get("tokens", {})
         value = tokens.get("total", 0)
         if isinstance(value, int):
-            total += value
-    return total
+            total_tokens += value
+    return steps, total_tokens
+
+
+def _sum_step_finish_total_tokens(output: bytes) -> int:
+    """Sum `tokens.total` across all step_finish events in opencode stdout."""
+    _, total_tokens = _summarize_step_finish_usage(output)
+    return total_tokens
+
+
+def _normalize_agent_run_result(
+    result: int | AgentRunResult,
+    *,
+    completed_steps: int,
+    total_tokens: int,
+) -> AgentRunResult:
+    """Normalize custom and default run-agent return values."""
+    if isinstance(result, AgentRunResult):
+        return AgentRunResult(
+            exit_code=result.exit_code,
+            completed_steps=completed_steps
+            if result.completed_steps is None
+            else result.completed_steps,
+            total_tokens=total_tokens if result.total_tokens is None else result.total_tokens,
+            failure_detail=result.failure_detail,
+            failure_stage=result.failure_stage,
+            retry_after_seconds=result.retry_after_seconds,
+        )
+    return AgentRunResult(
+        exit_code=int(result),
+        completed_steps=completed_steps,
+        total_tokens=total_tokens,
+    )
 
 
 class Router:
@@ -206,6 +252,8 @@ class Router:
         console: Console | None = None,
         tui: RouterTUI | None = None,
         config: Config | None = None,
+        backend_allocator: object | None = None,
+        configured_backends: list[BackendDefinition] | None = None,
     ) -> None:
         self._db = db
         self._repo_root = repo_root
@@ -225,7 +273,110 @@ class Router:
         self._console = console or Console()
         self._tui = tui
         self._stop = asyncio.Event()
+        self._hard_stop = asyncio.Event()
+        self._startup_recovery_complete = False
+        self._git_setup_gate = asyncio.Lock()
+        self._last_dispatch_steps = 0
         self._last_dispatch_tokens = 0
+        self._configured_backends = (
+            configured_backends
+            if configured_backends is not None
+            else load_configured_backends(repo_root, config=self._config)
+        )
+        self._backend_store = BackendStateStore(db) if self._configured_backends else None
+        self._backend_allocator = backend_allocator
+        if self._backend_allocator is None and self._configured_backends:
+            assert self._backend_store is not None
+            self._backend_allocator = BackendAllocator(self._backend_store)
+        self._hidden_helper_pool = HiddenHelperSemaphorePool.from_config(self._config.agents)
+
+    # ── Hidden-helper concurrency ────────────────────────────────────────────
+
+    @property
+    def hidden_helper_pool(self) -> HiddenHelperSemaphorePool:
+        """The semaphore pool bounding concurrent hidden-helper sessions."""
+        return self._hidden_helper_pool
+
+    def acquire_helper_slot(self, helper_role: str) -> object:
+        """Context manager that blocks until a slot is available for ``helper_role``.
+
+        Returns the pool's context manager directly so callers can use::
+
+            async with router.acquire_helper_slot("patch-reviewer"):
+                ...
+        """
+        return self._hidden_helper_pool.acquire(helper_role)
+
+    async def _complete_backend_attempt(
+        self,
+        *,
+        lease_id: int | None,
+        step_reservation_id: int | None,
+        actual_steps: int,
+    ) -> None:
+        """Finalize persisted lease and reservation state for one backend attempt."""
+        if lease_id is None or self._backend_store is None:
+            return
+
+        lease = await self._backend_store.get_lease(lease_id)
+        if lease is None or lease.status != "active":
+            return
+
+        completed_at = datetime.now(UTC).isoformat()
+        await self._backend_store.complete_lease(
+            lease_id,
+            completed_at=completed_at,
+            actual_steps=actual_steps,
+        )
+        if step_reservation_id is not None:
+            await self._backend_store.reconcile_step_usage(
+                step_reservation_id,
+                actual_steps=actual_steps,
+                reconciled_at=completed_at,
+            )
+
+    async def _apply_retryable_backend_failure(
+        self,
+        *,
+        backend_id: str,
+        logical_agent: str,
+        failure_classification: str,
+        failure_detail: str,
+        retry_after_seconds: int | None,
+    ) -> None:
+        """Persist cooldown and failure state for a retryable backend failure."""
+        if self._backend_store is None:
+            return
+
+        failed_at = datetime.now(UTC)
+        if failure_classification == "offline":
+            failure_state = await self._backend_store.record_failure(
+                backend_id=backend_id,
+                logical_agent=logical_agent,
+                failure_classification=failure_classification,
+                failed_at=failed_at.isoformat(),
+            )
+            cooldown_seconds = offline_cooldown_seconds(failure_state.consecutive_failures)
+            await self._backend_store.set_cooldown(
+                backend_id=backend_id,
+                logical_agent=logical_agent,
+                cooldown_until=(failed_at + timedelta(seconds=cooldown_seconds)).isoformat(),
+                failure_classification=failure_classification,
+                reason=failure_detail or "offline pre-execution failure",
+                set_at=failed_at.isoformat(),
+            )
+            return
+
+        if failure_classification == "rate_limit":
+            cooldown_seconds = retry_after_seconds or 300
+            await self._backend_store.set_cooldown(
+                backend_id=backend_id,
+                logical_agent=logical_agent,
+                cooldown_until=(failed_at + timedelta(seconds=cooldown_seconds)).isoformat(),
+                failure_classification=failure_classification,
+                reason=failure_detail or "rate limit pre-execution failure",
+                set_at=failed_at.isoformat(),
+            )
 
     async def validate_feature_branch(self) -> None:
         """Verify origin/issue-{N} exists when issue_id is set. Raises SystemExit if missing."""
@@ -298,6 +449,9 @@ class Router:
             return None
 
         if ticket.state == "Code Review":
+            pr_gate = await self._apply_patch_review_handoff_gate(ticket)
+            if pr_gate == "rerouted":
+                return ticket_id
             ci_gate = await self._apply_code_review_ci_gate(ticket)
             if ci_gate == "skip":
                 return None
@@ -338,10 +492,11 @@ class Router:
                 return ticket_id
 
         # Rework loop escalation
-        if ticket.state == "Rework" and ticket.rework_loop_count >= MAX_REWORK_LOOPS:
+        max_rework_loops = self._config.router.max_rework_loops
+        if ticket.state == "Rework" and ticket.rework_loop_count >= max_rework_loops:
             self._log(
                 f"[yellow]↑[/yellow] [bold]{ticket_id}[/bold] rework limit reached"
-                f" ({ticket.rework_loop_count}/{MAX_REWORK_LOOPS}) → Needs Human Review"
+                f" ({ticket.rework_loop_count}/{max_rework_loops}) → Needs Human Review"
             )
             await update_ticket(self._db, ticket_id, state="Needs Human Review")
             await add_comment(
@@ -373,9 +528,106 @@ class Router:
         await self._dispatch(ticket_id, agent_type)
         return ticket_id
 
-    async def _advance_to_next_issue(self) -> int | None:
+    async def get_routable_coder_batch(self, limit: int | None = None) -> list[str]:
+        """Return up to ``limit`` dependency-safe coder tickets for future dispatch."""
+        requested_limit = limit or self._config.router.max_parallel_coder_dispatches
+
+        if self._all_issues and self._issue_id is None:
+            await self._advance_to_next_issue(states=CODER_ROUTABLE_STATES)
+
+        ticket_ids = await get_routable_batch(
+            self._db,
+            states=CODER_ROUTABLE_STATES,
+            issue_id=self._issue_id,
+            limit=requested_limit,
+        )
+
+        if not ticket_ids and self._all_issues:
+            next_issue = await self._advance_to_next_issue(states=CODER_ROUTABLE_STATES)
+            if next_issue is not None:
+                ticket_ids = await get_routable_batch(
+                    self._db,
+                    states=CODER_ROUTABLE_STATES,
+                    issue_id=self._issue_id,
+                    limit=requested_limit,
+                )
+
+        return ticket_ids
+
+    async def _launch_parallel_coder_dispatches(
+        self,
+        active_dispatches: dict[str, asyncio.Task[None]],
+    ) -> int:
+        """Launch up to the configured number of coder dispatches in parallel."""
+        max_parallel = self._config.router.max_parallel_coder_dispatches
+        available_slots = max_parallel - len(active_dispatches)
+        if available_slots <= 0:
+            return 0
+
+        candidate_ids = await self.get_routable_coder_batch(
+            limit=available_slots + len(active_dispatches)
+        )
+        launched = 0
+        for ticket_id in candidate_ids:
+            if ticket_id in active_dispatches:
+                continue
+            task = asyncio.create_task(self._run_parallel_coder_dispatch(ticket_id))
+            active_dispatches[ticket_id] = task
+            launched += 1
+            if launched >= available_slots:
+                break
+        return launched
+
+    async def _run_parallel_coder_dispatch(self, ticket_id: str) -> None:
+        """Run one coder dispatch in the background with local exception handling."""
+        try:
+            await self._dispatch(ticket_id, "coder")
+        except Exception:
+            logger.exception("Error during parallel coder dispatch for %s", ticket_id)
+
+    async def _wait_for_active_dispatches(
+        self,
+        active_dispatches: dict[str, asyncio.Task[None]],
+    ) -> None:
+        """Wait for active coder work to progress or for the stop signal."""
+        if not active_dispatches:
+            return
+
+        stop_wait = asyncio.create_task(self._stop.wait())
+        try:
+            done, pending = await asyncio.wait(
+                [*active_dispatches.values(), stop_wait],
+                timeout=self._poll_interval,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                if task is stop_wait:
+                    task.cancel()
+            for task in done:
+                if task is stop_wait:
+                    continue
+                try:
+                    await task
+                except Exception:
+                    logger.exception("Parallel coder dispatch task failed")
+        finally:
+            if not stop_wait.done():
+                stop_wait.cancel()
+
+    def _reap_completed_dispatches(
+        self,
+        active_dispatches: dict[str, asyncio.Task[None]],
+    ) -> None:
+        """Drop finished background coder tasks from the active map."""
+        finished = [ticket_id for ticket_id, task in active_dispatches.items() if task.done()]
+        for ticket_id in finished:
+            active_dispatches.pop(ticket_id, None)
+
+    async def _advance_to_next_issue(
+        self, *, states: tuple[str, ...] = ROUTABLE_STATES
+    ) -> int | None:
         """Find the next issue with routable tickets, update _issue_id, return it or None."""
-        issue_ids = await get_routable_issue_ids(self._db, states=ROUTABLE_STATES)
+        issue_ids = await get_routable_issue_ids(self._db, states=states)
         # Find the first issue_id greater than the current one
         for iid in issue_ids:
             if self._issue_id is None or iid > self._issue_id:
@@ -410,7 +662,8 @@ class Router:
             return
 
         base_ref = f"origin/{feature_branch_name(ticket.issue_id)}"
-        await self._create_worktree(ticket_id, branch, worktree_dir, base_ref)
+        async with self._git_setup_gate:
+            await self._create_worktree(ticket_id, branch, worktree_dir, base_ref)
 
         if not worktree_dir.is_dir():
             logger.error("Worktree directory missing after creation attempt: %s", worktree_dir)
@@ -442,6 +695,16 @@ class Router:
 
         comments = await get_ticket_comments(self._db, ticket_id)
         comments_data = [{"author": c.author, "body": c.body} for c in comments]
+        if agent_type == "reviewer":
+            delegation_entries = await list_delegation_context(self._db, ticket_id)
+            for entry in delegation_entries:
+                helper_role = str(entry.step).removeprefix("delegation:")
+                comments_data.append(
+                    {
+                        "author": f"delegation:{helper_role}",
+                        "body": str(entry.output),
+                    }
+                )
 
         import json as _json
 
@@ -463,6 +726,15 @@ class Router:
             "step_budget": step_budget,
             "model": model_name,
         }
+        dispatch_agent = agent_type
+        selected_backend_id: str | None = None
+        selected_physical_alias: str | None = None
+        allocation_reason: str | None = None
+        selected_lease_id: int | None = None
+        selected_step_reserve: int | None = None
+        selected_step_reservation_id: int | None = None
+        selected_attempt_id: int | None = None
+        remaining_backends = list(self._configured_backends)
 
         # Pre-flight validation gate: run validators before dispatching a coder on new
         # (To Do) work. If the baseline is broken the coder can't distinguish its own
@@ -606,51 +878,186 @@ class Router:
                 )
                 return
 
-        if self._tui:
-            issue_id = getattr(ticket, "issue_id", None)
-            issue_label = f"Issue-{issue_id}" if issue_id is not None else "—"
-            issue_tickets = [
-                (t.id, t.state)
-                for t in await list_tickets(self._db)
-                if getattr(t, "issue_id", None) == issue_id
-            ]
-            dependencies = await get_dependencies(self._db, ticket_id)
-            self._tui.set_dispatching(
-                ticket_id,
-                ticket.title,
-                ticket.state,
-                agent_type,
-                total_tickets=len(issue_tickets),
-                issue_label=issue_label,
-                issue_tickets=issue_tickets,
-                risk_score=getattr(ticket, "risk_score", None),
-                rework_count=getattr(ticket, "rework_loop_count", 0),
-                dependencies=dependencies,
-                model=str(model_name),
-                step_budget=int(step_budget),
+        # Prune payload deterministically before backend selection.
+        # Runs here so the payload size is independent of which backend is chosen.
+        _pruned = prune_dispatch_payload(
+            agent_role=agent_type,
+            ticket_state=pre_dispatch_state,
+            ticket=ticket_to_dict(ticket),
+            comments=comments_data,
+            hindsight_context=dict(dispatch_config.get("hindsight_context") or {}),
+            validation_data={
+                "validation_commands": list(dispatch_config.get("validation_commands") or []),
+                "validation_results": list(dispatch_config.get("validation_results") or []),
+            },
+        )
+        comments_data = _pruned.comments
+        dispatch_config["hindsight_context"] = _pruned.hindsight_context
+        dispatch_config["validation_results"] = _pruned.validation_results
+        dispatch_config["truncation_markers"] = _pruned.truncation_markers
+
+        while True:
+            selected_backend_id = None
+            selected_physical_alias = None
+            allocation_reason = None
+            selected_lease_id = None
+            selected_step_reservation_id = None
+            selected_attempt_id = None
+            dispatch_agent = agent_type
+            dispatch_config.pop("backend", None)
+
+            if (
+                agent_type == "coder"
+                and self._backend_allocator is not None
+                and remaining_backends
+            ):
+                allocated_at = datetime.now(UTC)
+                allocation = await self._backend_allocator.allocate(
+                    backends=remaining_backends,
+                    logical_agent=agent_type,
+                    ticket_id=ticket_id,
+                    required_steps=int(step_budget),
+                    allocated_at=allocated_at.isoformat(),
+                    stale_after=(allocated_at + timedelta(minutes=30)).isoformat(),
+                )
+                if isinstance(allocation, BackendNoCapacity):
+                    await update_ticket(self._db, ticket_id, state=pre_dispatch_state)
+                    await add_comment(
+                        self._db,
+                        ticket_id,
+                        (
+                            "Router could not allocate an eligible coder backend. "
+                            "Ticket left in queue."
+                        ),
+                        author="router",
+                    )
+                    return
+
+                assert isinstance(allocation, BackendAllocation)
+                dispatch_agent = allocation.backend.physical_alias
+                model_name = allocation.backend.model
+                selected_backend_id = allocation.backend.id
+                selected_physical_alias = allocation.backend.physical_alias
+                allocation_reason = "priority allocation"
+                lease_id = getattr(allocation.lease, "id", None)
+                if isinstance(lease_id, int):
+                    selected_lease_id = lease_id
+                step_reserve = getattr(allocation.lease, "step_reserve", None)
+                if isinstance(step_reserve, int):
+                    selected_step_reserve = step_reserve
+                step_reservation_id = getattr(allocation.step_reservation, "id", None)
+                if isinstance(step_reservation_id, int):
+                    selected_step_reservation_id = step_reservation_id
+                selected_attempt_id = allocation.attempt_id
+                dispatch_config["model"] = model_name
+                dispatch_config["backend"] = {
+                    "id": selected_backend_id,
+                    "physical_alias": selected_physical_alias,
+                    "allocation_reason": allocation_reason,
+                }
+
+            if self._tui:
+                issue_id = getattr(ticket, "issue_id", None)
+                issue_label = f"Issue-{issue_id}" if issue_id is not None else "—"
+                issue_tickets = [
+                    (t.id, t.state)
+                    for t in await list_tickets(self._db)
+                    if getattr(t, "issue_id", None) == issue_id
+                ]
+                dependencies = await get_dependencies(self._db, ticket_id)
+                self._tui.set_dispatching(
+                    ticket_id,
+                    ticket.title,
+                    ticket.state,
+                    agent_type,
+                    total_tickets=len(issue_tickets),
+                    issue_label=issue_label,
+                    issue_tickets=issue_tickets,
+                    risk_score=getattr(ticket, "risk_score", None),
+                    rework_count=getattr(ticket, "rework_loop_count", 0),
+                    dependencies=dependencies,
+                    model=str(model_name),
+                    step_budget=int(step_budget),
+                    backend_id=selected_backend_id or "",
+                    physical_alias=selected_physical_alias or "",
+                    step_reserve=selected_step_reserve,
+                )
+
+            self._log(
+                f"[cyan]→[/cyan] [bold]{ticket_id}[/bold] dispatching [cyan]{agent_type}[/cyan]"
+                f"  [dim]{worktree_dir}[/dim]"
             )
 
-        self._log(
-            f"[cyan]→[/cyan] [bold]{ticket_id}[/bold] dispatching [cyan]{agent_type}[/cyan]"
-            f"  [dim]{worktree_dir}[/dim]"
-        )
+            payload = build_dispatch_prompt(
+                ticket_to_dict(ticket),
+                agent_type,
+                comments=comments_data,
+                config=dispatch_config,
+            )
+            dispatch_file = worktree_dir / f"ORCH_DISPATCH_{ticket_id}.md"
+            dispatch_file.write_text(payload)
 
-        payload = build_dispatch_prompt(
-            ticket_to_dict(ticket),
-            agent_type,
-            comments=comments_data,
-            config=dispatch_config,
-        )
-        dispatch_file = worktree_dir / f"ORCH_DISPATCH_{ticket_id}.md"
-        dispatch_file.write_text(payload)
+            prompt = (
+                f"Read ORCH_DISPATCH_{ticket_id}.md in the current"
+                " directory for your full dispatch payload, then begin."
+            )
 
-        prompt = (
-            f"Read ORCH_DISPATCH_{ticket_id}.md in the current"
-            " directory for your full dispatch payload, then begin."
-        )
+            self._last_dispatch_steps = 0
+            self._last_dispatch_tokens = 0
+            run_result = _normalize_agent_run_result(
+                await self._run_agent(ticket_id, worktree_dir, dispatch_agent, prompt),
+                completed_steps=self._last_dispatch_steps,
+                total_tokens=self._last_dispatch_tokens,
+            )
+            self._last_dispatch_steps = run_result.completed_steps or 0
+            self._last_dispatch_tokens = run_result.total_tokens or 0
+            exit_code = run_result.exit_code
 
-        self._last_dispatch_tokens = 0
-        exit_code = await self._run_agent(ticket_id, worktree_dir, agent_type, prompt)
+            failure_decision = None
+            if exit_code > 0 and selected_backend_id is not None:
+                failure_decision = classify_backend_failure(
+                    exit_code=exit_code,
+                    completed_steps=self._last_dispatch_steps,
+                    failure_detail=run_result.failure_detail,
+                    failure_stage=run_result.failure_stage,
+                    retry_after_seconds=run_result.retry_after_seconds,
+                )
+                if (
+                    failure_decision is not None
+                    and selected_attempt_id is not None
+                    and self._backend_store is not None
+                ):
+                    await self._backend_store.set_dispatch_attempt_failure(
+                        selected_attempt_id,
+                        failure_classification=failure_decision.classification,
+                    )
+
+            if exit_code >= 0:
+                await self._complete_backend_attempt(
+                    lease_id=selected_lease_id,
+                    step_reservation_id=selected_step_reservation_id,
+                    actual_steps=self._last_dispatch_steps,
+                )
+
+            if (
+                failure_decision is not None
+                and failure_decision.safe_to_retry
+                and selected_backend_id is not None
+            ):
+                await self._apply_retryable_backend_failure(
+                    backend_id=selected_backend_id,
+                    logical_agent=agent_type,
+                    failure_classification=failure_decision.classification,
+                    failure_detail=run_result.failure_detail,
+                    retry_after_seconds=failure_decision.cooldown_seconds,
+                )
+                remaining_backends = [
+                    backend for backend in remaining_backends if backend.id != selected_backend_id
+                ]
+                if remaining_backends:
+                    continue
+            break
+
         if exit_code == 0:
             from orch.metrics import record_ticket_metric
 
@@ -658,8 +1065,12 @@ class Router:
                 self._db,
                 ticket_id=ticket_id,
                 agent_type=agent_type,
+                logical_agent=agent_type,
                 model=str(model_name),
                 total_tokens=int(self._last_dispatch_tokens),
+                backend_id=selected_backend_id,
+                physical_alias=selected_physical_alias,
+                allocation_reason=allocation_reason,
             )
 
         ticket = await get_ticket(self._db, ticket_id)
@@ -716,7 +1127,7 @@ class Router:
             await self._retain_review_outcome(ticket_id)
 
         if self._tui:
-            self._tui.on_agent_done()
+            self._tui.on_agent_done(ticket_id)
 
     async def _fast_merge(self, ticket: object) -> None:
         """Merge a low-risk approved PR directly from the router."""
@@ -1190,6 +1601,33 @@ class Router:
         if isinstance(rollup, list):
             return rollup
         return None
+
+    async def _apply_patch_review_handoff_gate(self, ticket: object) -> str:
+        """Gate Code Review dispatch on patch-reviewer output for nontrivial diffs.
+
+        Returns 'allow' if the ticket may proceed to reviewer dispatch, or
+        'rerouted' if it has been moved to Rework with an actionable comment.
+        """
+        ticket_id = str(getattr(ticket, "id", ""))
+        ctx = await build_patch_review_context(self._db, ticket_id)
+        decision = check_patch_review_handoff_gate(ctx)
+        if decision.allowed:
+            return "allow"
+
+        await update_ticket(self._db, ticket_id, state="Rework")
+        await add_comment(
+            self._db,
+            ticket_id,
+            decision.message or "## ROUTER_GATE: PATCH_REVIEW_REQUIRED",
+            author="router",
+        )
+        if self._tui:
+            self._tui.set_ticket_state("Rework")
+        self._log(
+            f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold]"
+            " patch-review gate: no verdict for current attempt → Rework"
+        )
+        return "rerouted"
 
     async def _apply_code_review_ci_gate(self, ticket: object) -> str:
         """Apply deterministic CI gating for Code Review tickets."""
@@ -1759,33 +2197,190 @@ class Router:
             f"[yellow]↺[/yellow] [bold]{ticket_id}[/bold] full reset → To Do (worktree removed)"
         )
 
+    async def _recover_stale_backend_leases_on_startup(self) -> None:
+        """Preserve orphaned backend work conservatively when a prior router run died."""
+        if self._startup_recovery_complete or self._backend_store is None:
+            self._startup_recovery_complete = True
+            return
+
+        self._startup_recovery_complete = True
+        stale_as_of = datetime.now(UTC).isoformat()
+        stale_leases = await self._backend_store.mark_active_leases_stale(stale_as_of)
+        if not stale_leases:
+            return
+
+        self._log(
+            "[yellow]↺[/yellow] startup recovery marked "
+            f"{len(stale_leases)} stale backend lease(s)"
+        )
+
+        for lease in stale_leases:
+            attempts = await self._backend_store.list_dispatch_attempts(lease.ticket_id)
+            for attempt in reversed(attempts):
+                if (
+                    attempt.selected_backend_id == lease.backend_id
+                    and attempt.skipped_reason is None
+                    and attempt.failure_classification is None
+                ):
+                    await self._backend_store.set_dispatch_attempt_failure(
+                        attempt.id,
+                        failure_classification="ambiguous",
+                    )
+                    break
+
+            ticket = await get_ticket(self._db, lease.ticket_id)
+            if ticket is None or ticket.state != "In Progress":
+                continue
+
+            await update_ticket(self._db, lease.ticket_id, state="Needs Human Review")
+            await add_comment(
+                self._db,
+                lease.ticket_id,
+                "\n".join(
+                    [
+                        "## ROUTER_STARTUP_RECOVERY: STALE_BACKEND_LEASE",
+                        "",
+                        (
+                            "**Result:** Router startup found a stale backend lease from a prior "
+                            "interrupted dispatch."
+                        ),
+                        (
+                            "**Action:** marked the lease stale, recorded the backend attempt as "
+                            "`ambiguous`, and moved the ticket to `Needs Human Review` to avoid "
+                            "blind retry."
+                        ),
+                    ]
+                ),
+                author="router",
+            )
+            await self._fire_webhook(lease.ticket_id, "In Progress", "Needs Human Review")
+
     async def run(self) -> None:
         """Enter the polling loop until stopped."""
+        await self._recover_stale_backend_leases_on_startup()
+
         idle_cycles = 0
+        active_coder_dispatches: dict[str, asyncio.Task[None]] = {}
         while not self._stop.is_set():
+            self._reap_completed_dispatches(active_coder_dispatches)
             try:
-                dispatched = await self.poll_once()
+                if self._config.router.max_parallel_coder_dispatches > 1:
+                    launched = await self._launch_parallel_coder_dispatches(
+                        active_coder_dispatches
+                    )
+                    if launched:
+                        idle_cycles = 0
+                        continue
+                    if not active_coder_dispatches:
+                        dispatched = await self.poll_once()
+                    else:
+                        dispatched = None
+                else:
+                    dispatched = await self.poll_once()
+
                 if dispatched:
-                    # Something was dispatched — re-poll immediately so the next
-                    # stage (e.g. merger after reviewer approves) starts without
-                    # waiting a full poll interval.
                     idle_cycles = 0
                     continue
-                else:
-                    idle_cycles += 1
-                    # Print a heartbeat every 6 idle cycles (~1 min at default interval)
-                    if idle_cycles % 6 == 1:
-                        self._log("[dim]polling — no routable tickets[/dim]")
+                idle_cycles += 1
+                if idle_cycles % 6 == 1:
+                    self._log("[dim]polling — no routable tickets[/dim]")
             except Exception:
                 logger.exception("Error during poll cycle")
+            if active_coder_dispatches:
+                await self._wait_for_active_dispatches(active_coder_dispatches)
+                continue
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._poll_interval)
                 break
             except TimeoutError:
                 continue
 
+        self._reap_completed_dispatches(active_coder_dispatches)
+        if active_coder_dispatches:
+            count = len(active_coder_dispatches)
+            noun = "dispatch" if count == 1 else "dispatches"
+            self._log(f"[yellow]↺[/yellow] stop requested — waiting for {count} active {noun}")
+            await self._wait_for_shutdown_dispatches(active_coder_dispatches)
+
+    async def _wait_for_shutdown_dispatches(
+        self,
+        active_dispatches: dict[str, asyncio.Task[None]],
+    ) -> None:
+        """Wait for graceful completion unless a second stop requests hard cancellation."""
+        wait_task = asyncio.gather(*active_dispatches.values(), return_exceptions=True)
+        hard_stop_task = asyncio.create_task(self._hard_stop.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                [wait_task, hard_stop_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if hard_stop_task in done and not wait_task.done():
+                self._log("[red]✗[/red] hard stop requested — draining in-flight helper sessions")
+                await self._hidden_helper_pool.wait_for_in_flight()
+                self._log("[red]✗[/red] cancelling active dispatches")
+                for task in active_dispatches.values():
+                    task.cancel()
+                await asyncio.gather(*active_dispatches.values(), return_exceptions=True)
+                await self._mark_active_backend_leases_ambiguous(reason="router hard cancellation")
+        finally:
+            if not hard_stop_task.done():
+                hard_stop_task.cancel()
+            if not wait_task.done():
+                wait_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wait_task
+
+    async def _mark_active_backend_leases_ambiguous(self, *, reason: str) -> None:
+        """Mark active backend leases ambiguous after forced cancellation."""
+        if self._backend_store is None:
+            return
+
+        stale_as_of = datetime.now(UTC).isoformat()
+        stale_leases = await self._backend_store.mark_active_leases_stale(stale_as_of)
+        if not stale_leases:
+            return
+
+        for lease in stale_leases:
+            attempts = await self._backend_store.list_dispatch_attempts(lease.ticket_id)
+            for attempt in reversed(attempts):
+                if (
+                    attempt.selected_backend_id == lease.backend_id
+                    and attempt.skipped_reason is None
+                    and attempt.failure_classification is None
+                ):
+                    await self._backend_store.set_dispatch_attempt_failure(
+                        attempt.id,
+                        failure_classification="ambiguous",
+                    )
+                    break
+
+            ticket = await get_ticket(self._db, lease.ticket_id)
+            if ticket is None or ticket.state != "In Progress":
+                continue
+            await update_ticket(self._db, lease.ticket_id, state="Needs Human Review")
+            await add_comment(
+                self._db,
+                lease.ticket_id,
+                "\n".join(
+                    [
+                        "## ROUTER_HARD_CANCEL: ACTIVE_BACKEND_DISPATCH",
+                        "",
+                        f"**Result:** {reason}.",
+                        (
+                            "**Action:** marked the active backend lease stale, recorded the "
+                            "attempt as `ambiguous`, and moved the ticket to "
+                            "`Needs Human Review` to avoid blind retry."
+                        ),
+                    ]
+                ),
+                author="router",
+            )
+
     def stop(self) -> None:
-        """Signal the router to stop after the current dispatch completes."""
+        """Signal graceful stop first, then hard cancellation on a second call."""
+        if self._stop.is_set():
+            self._hard_stop.set()
+            return
         self._stop.set()
 
     def _sync_opencode_to_worktree(self, worktree_dir: Path) -> None:
@@ -1835,6 +2430,14 @@ class Router:
             dst_tools.mkdir(exist_ok=True)
             for f in src_tools.glob("*.ts"):
                 shutil.copy2(f, dst_tools / f.name)
+
+        # Plugins — copy fresh every dispatch
+        src_plugins = src_opencode / "plugin"
+        if src_plugins.is_dir():
+            dst_plugins = dst_opencode / "plugin"
+            dst_plugins.mkdir(exist_ok=True)
+            for f in src_plugins.glob("*.js"):
+                shutil.copy2(f, dst_plugins / f.name)
 
         # node_modules — symlink once (large, doesn't change per dispatch)
         src_nm = src_opencode / "node_modules"
@@ -2114,7 +2717,7 @@ class Router:
 
     async def _default_run_agent(
         self, ticket_id: str, worktree_dir: Path, agent_type: str, payload: str
-    ) -> int:
+    ) -> AgentRunResult:
         import os
 
         # state_dir/logs/ — computed from repo_root so it's correct regardless
@@ -2158,23 +2761,52 @@ class Router:
                     if label == "out":
                         self._tui.parse_agent_line(ticket_id, line)
                     elif line.strip():
-                        self._tui.log(f"  [dim]{line.decode(errors='replace').rstrip()}[/dim]")
+                        text = line.decode(errors="replace").rstrip()
+                        prefix = "waiting for hidden-helper slot:"
+                        if text.startswith(prefix):
+                            helper_role = text.removeprefix(prefix).strip()
+                            self._tui.set_dispatch_waiting_for_helper(ticket_id, helper_role)
+                        self._tui.log(f"  [dim]{text}[/dim]")
                 elif self._verbose:
                     self._console.print(
                         f"  [dim]{ticket_id}[/dim] [dim]{label}[/dim]"
                         f" {line.decode(errors='replace').rstrip()}"
                     )
 
-        await asyncio.gather(
-            _read_stream(proc.stdout, stdout_chunks, "out"),  # type: ignore[arg-type]
-            _read_stream(proc.stderr, stderr_chunks, "err"),  # type: ignore[arg-type]
+        stdout_task = asyncio.create_task(
+            _read_stream(proc.stdout, stdout_chunks, "out")  # type: ignore[arg-type]
         )
-        await proc.wait()
+        stderr_task = asyncio.create_task(
+            _read_stream(proc.stderr, stderr_chunks, "err")  # type: ignore[arg-type]
+        )
+        try:
+            await asyncio.gather(stdout_task, stderr_task)
+            await proc.wait()
+        except asyncio.CancelledError:
+            stdout_task.cancel()
+            stderr_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(stdout_task, stderr_task)
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            raise
 
         stdout = b"".join(stdout_chunks)
         stderr = b"".join(stderr_chunks)
-        self._last_dispatch_tokens = _sum_step_finish_total_tokens(stdout)
+        self._last_dispatch_steps, self._last_dispatch_tokens = _summarize_step_finish_usage(
+            stdout
+        )
         log_file.write_bytes(b"=== STDOUT ===\n" + stdout + b"\n=== STDERR ===\n" + stderr)
         self._log(f"  [dim]{ticket_id} log → {log_file}[/dim]")
 
-        return proc.returncode or 0
+        return AgentRunResult(
+            exit_code=proc.returncode or 0,
+            completed_steps=self._last_dispatch_steps,
+            total_tokens=self._last_dispatch_tokens,
+            failure_detail=stderr.decode(errors="replace").strip(),
+        )

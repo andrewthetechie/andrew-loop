@@ -108,9 +108,92 @@ class TicketMetrics(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ticket_id: Mapped[str] = mapped_column(Text, ForeignKey("tickets.id"), nullable=False)
     agent_type: Mapped[str] = mapped_column(Text, nullable=False)
+    logical_agent: Mapped[str | None] = mapped_column(Text)
     model: Mapped[str] = mapped_column(Text, nullable=False)
     total_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    backend_id: Mapped[str | None] = mapped_column(Text)
+    physical_alias: Mapped[str | None] = mapped_column(Text)
+    allocation_reason: Mapped[str | None] = mapped_column(Text)
     dispatched_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class BackendLease(Base):
+    __tablename__ = "backend_leases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    backend_id: Mapped[str] = mapped_column(Text, nullable=False)
+    logical_agent: Mapped[str] = mapped_column(Text, nullable=False)
+    physical_alias: Mapped[str] = mapped_column(Text, nullable=False)
+    ticket_id: Mapped[str] = mapped_column(Text, nullable=False)
+    step_reserve: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    lease_started_at: Mapped[str] = mapped_column(Text, nullable=False)
+    stale_after: Mapped[str] = mapped_column(Text, nullable=False)
+    completed_at: Mapped[str | None] = mapped_column(Text)
+    stale_marked_at: Mapped[str | None] = mapped_column(Text)
+    actual_steps: Mapped[int | None] = mapped_column(Integer)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'completed', 'stale')",
+            name="valid_backend_lease_status",
+        ),
+    )
+
+
+class BackendStepUsage(Base):
+    __tablename__ = "backend_step_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    backend_id: Mapped[str] = mapped_column(Text, nullable=False)
+    logical_agent: Mapped[str] = mapped_column(Text, nullable=False)
+    ticket_id: Mapped[str] = mapped_column(Text, nullable=False)
+    reserved_steps: Mapped[int] = mapped_column(Integer, nullable=False)
+    actual_steps: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    reserved_at: Mapped[str] = mapped_column(Text, nullable=False)
+    reconciled_at: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('reserved', 'reconciled')",
+            name="valid_backend_step_usage_status",
+        ),
+    )
+
+
+class BackendCooldown(Base):
+    __tablename__ = "backend_cooldowns"
+
+    backend_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    logical_agent: Mapped[str] = mapped_column(Text, nullable=False)
+    cooldown_until: Mapped[str] = mapped_column(Text, nullable=False)
+    failure_classification: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    set_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class BackendDispatchAttempt(Base):
+    __tablename__ = "backend_dispatch_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[str] = mapped_column(Text, nullable=False)
+    logical_agent: Mapped[str] = mapped_column(Text, nullable=False)
+    selected_backend_id: Mapped[str] = mapped_column(Text, nullable=False)
+    physical_alias: Mapped[str] = mapped_column(Text, nullable=False)
+    failure_classification: Mapped[str | None] = mapped_column(Text)
+    skipped_reason: Mapped[str | None] = mapped_column(Text)
+    attempted_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class BackendFailureState(Base):
+    __tablename__ = "backend_failure_state"
+
+    backend_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    logical_agent: Mapped[str] = mapped_column(Text, nullable=False)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False)
+    last_failure_classification: Mapped[str] = mapped_column(Text, nullable=False)
+    last_failure_at: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 @event.listens_for(Engine, "connect")

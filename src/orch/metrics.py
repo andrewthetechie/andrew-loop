@@ -61,8 +61,12 @@ async def record_ticket_metric(
     *,
     ticket_id: str,
     agent_type: str,
+    logical_agent: str | None = None,
     model: str,
     total_tokens: int,
+    backend_id: str | None = None,
+    physical_alias: str | None = None,
+    allocation_reason: str | None = None,
     dispatched_at: str | None = None,
 ) -> None:
     """Insert one append-only metrics row for a dispatch."""
@@ -74,16 +78,40 @@ async def record_ticket_metric(
             text(
                 """
                 INSERT INTO ticket_metrics
-                    (ticket_id, agent_type, model, total_tokens, dispatched_at)
+                    (
+                        ticket_id,
+                        agent_type,
+                        logical_agent,
+                        model,
+                        total_tokens,
+                        backend_id,
+                        physical_alias,
+                        allocation_reason,
+                        dispatched_at
+                    )
                 VALUES
-                    (:ticket_id, :agent_type, :model, :total_tokens, :dispatched_at)
+                    (
+                        :ticket_id,
+                        :agent_type,
+                        :logical_agent,
+                        :model,
+                        :total_tokens,
+                        :backend_id,
+                        :physical_alias,
+                        :allocation_reason,
+                        :dispatched_at
+                    )
                 """
             ),
             {
                 "ticket_id": ticket_id,
                 "agent_type": agent_type,
+                "logical_agent": logical_agent,
                 "model": model,
                 "total_tokens": total_tokens,
+                "backend_id": backend_id,
+                "physical_alias": physical_alias,
+                "allocation_reason": allocation_reason,
                 "dispatched_at": dispatched_at,
             },
         )

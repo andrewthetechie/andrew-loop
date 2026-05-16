@@ -56,10 +56,9 @@ Default label vocabulary (needs-triage, needs-info, ready-for-agent, ready-for-h
 Single-context layout (one CONTEXT.md + docs/adr/ at the root). See `docs/agents/domain.md`.
 
 <!-- gitnexus:start -->
-
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **agent-system** (539 symbols, 786 relationships, 4 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **code-orchestra** (4281 symbols, 7861 relationships, 182 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -80,22 +79,22 @@ This project is indexed by GitNexus as **agent-system** (539 symbols, 786 relati
 
 ## Resources
 
-| Resource                                      | Use for                                  |
-| --------------------------------------------- | ---------------------------------------- |
-| `gitnexus://repo/agent-system/context`        | Codebase overview, check index freshness |
-| `gitnexus://repo/agent-system/clusters`       | All functional areas                     |
-| `gitnexus://repo/agent-system/processes`      | All execution flows                      |
-| `gitnexus://repo/agent-system/process/{name}` | Step-by-step execution trace             |
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/code-orchestra/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/code-orchestra/clusters` | All functional areas |
+| `gitnexus://repo/code-orchestra/processes` | All execution flows |
+| `gitnexus://repo/code-orchestra/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 
-| Task                                         | Read this skill file                                        |
-| -------------------------------------------- | ----------------------------------------------------------- |
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md`       |
-| Blast radius / "What breaks if I change X?"  | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?"             | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md`       |
-| Rename / extract / split / refactor          | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md`     |
-| Tools, resources, schema reference           | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md`           |
-| Index, status, clean, wiki CLI commands      | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md`             |
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->

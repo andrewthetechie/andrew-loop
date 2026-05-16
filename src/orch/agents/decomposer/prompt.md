@@ -144,8 +144,6 @@ Suggest dependencies between tickets. Identify which tickets block which. Struct
 Use the following tools for research and context during grilling and decomposition:
 
 - **Context7** — use `resolve-library-id` to identify libraries mentioned in the PRD, then `query-docs` to check API surfaces and constraints before decomposing.
-- **PullMD** — use `read_url` to fetch external docs, specs, or references linked in the PRD.
-- **Firecrawl** — use `search` to research technical approaches when the PRD references unfamiliar technology, `scrape` for JS-heavy documentation sites.
 - **GitNexus** — use `query` to understand the existing architecture before decomposing, `context` to understand symbol relationships and identify integration points for new tickets.
 - **Hindsight** — treat `## Hindsight Context` as the primary memory source when it is present in the dispatch payload.
 - **Serena** — use `find_symbol` and `get_symbols_overview` to understand existing code structure when identifying where changes should land.

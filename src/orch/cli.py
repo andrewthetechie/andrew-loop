@@ -1,10 +1,12 @@
 """CLI entrypoint for the orch orchestrator."""
 
 import asyncio
+import contextlib
 import json
 import re
 import sys
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,9 +17,12 @@ from rich.console import Console
 from rich.table import Table
 
 from orch import state as orch_state
+from orch.backend_state import BackendStateStore
+from orch.backends import BackendCatalogError, fixed_window_start, load_configured_backends
 from orch.config import Config
 from orch.db import VALID_STATES, Database
 from orch.doctor import run_doctor
+from orch.gates import build_patch_review_context, check_patch_review_handoff_gate
 from orch.init import default_runner, init_project
 from orch.metrics import get_issue_breakdown, list_issue_totals
 from orch.pr import create_pr, update_pr
@@ -49,6 +54,8 @@ console = Console()
 
 DEFAULT_DB_PATH = ".orchestra/state.db"
 DECOMPOSE_DISPATCH_FILE = "ORCH_DECOMPOSE.md"
+BackendHistoryQueues = dict[str, list[object]]
+BackendHistoryLoadResult = tuple[list[object], BackendHistoryQueues, BackendHistoryQueues]
 
 TICKET_TEMPLATE = """\
 # Fill in the ticket fields below. Lines starting with # are ignored.
@@ -85,6 +92,20 @@ class HindsightScopeError(click.ClickException):
 
     def __init__(self) -> None:
         super().__init__("Use --issue or --ticket, not both.")
+
+
+class BackendHistoryNotFoundError(click.ClickException):
+    """Raised when no backend history exists for a ticket."""
+
+    def __init__(self, ticket_id: str) -> None:
+        super().__init__(f"Unknown ticket id: {ticket_id}")
+
+
+class BackendNotFoundError(click.ClickException):
+    """Raised when a backend id is not configured."""
+
+    def __init__(self, backend_id: str) -> None:
+        super().__init__(f"Unknown backend id: {backend_id}")
 
 
 def _run(coro: object) -> object:
@@ -240,6 +261,74 @@ def completion(ctx: click.Context, shell: str) -> None:
             _completion_var(prog_name),
         ).source()
     )
+
+
+@main.group("hidden-helper-slot")
+def hidden_helper_slot() -> None:
+    """Internal hidden-helper slot coordination commands."""
+
+
+@hidden_helper_slot.command("hold")
+@click.argument("helper_role")
+def hidden_helper_slot_hold(helper_role: str) -> None:
+    """Acquire and hold a hidden-helper slot until stdin closes."""
+    import fcntl
+    import time
+
+    from orch.state import resolve_state_dir
+
+    helper_attr = helper_role.replace("-", "_")
+    repo_root = Path.cwd()
+    cfg = Config.load(repo_root=repo_root)
+    helper_cfg = getattr(cfg.agents, helper_attr, None)
+    max_concurrent = getattr(helper_cfg, "max_concurrent", 1)
+    if not isinstance(max_concurrent, int) or max_concurrent < 1:
+        max_concurrent = 1
+
+    slot_dir = resolve_state_dir(repo_root, base_dir=cfg.state.base_dir)
+    slot_dir = slot_dir / "hidden-helper-slots" / helper_role
+    slot_dir.mkdir(parents=True, exist_ok=True)
+
+    locked_file = None
+    waited = False
+    try:
+        while locked_file is None:
+            for slot in range(max_concurrent):
+                candidate = (slot_dir / f"{slot}.lock").open("a+")
+                try:
+                    fcntl.flock(candidate.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    candidate.seek(0)
+                    candidate.truncate()
+                    candidate.write(f"{helper_role} {slot}\n")
+                    candidate.flush()
+                    locked_file = candidate
+                    break
+                except BlockingIOError:
+                    candidate.close()
+            if locked_file is None:
+                if not waited:
+                    click.echo(f"waiting for hidden-helper slot: {helper_role}", err=True)
+                    waited = True
+                time.sleep(0.1)
+
+        click.echo(f"ACQUIRED {helper_role}", nl=True)
+        while sys.stdin.buffer.read(1):
+            pass
+    finally:
+        if locked_file is not None:
+            with contextlib.suppress(Exception):
+                fcntl.flock(locked_file.fileno(), fcntl.LOCK_UN)
+            locked_file.close()
+
+
+async def _reject_if_patch_review_required(db: Database, ticket_id: str) -> None:
+    ctx = await build_patch_review_context(db, ticket_id)
+    decision = check_patch_review_handoff_gate(ctx)
+    if decision.allowed:
+        return
+    message = decision.message or "## ROUTER_GATE: PATCH_REVIEW_REQUIRED"
+    await add_comment(db, ticket_id, message, author="router")
+    raise ValueError(message)
 
 
 @main.command()
@@ -677,6 +766,8 @@ def move(ctx: click.Context, ticket_id: str, new_state: str) -> None:
         db_path = ctx.obj["db_path"]
         async with Database(Path(db_path)) as db:
             try:
+                if new_state == "Code Review":
+                    await _reject_if_patch_review_required(db, ticket_id)
                 ticket = await move_ticket(db, ticket_id, new_state)
                 click.echo(f"{ticket.id} → {ticket.state}")
             except ValueError as e:
@@ -725,6 +816,8 @@ def update(
             try:
                 fields: dict[str, object] = {}
                 if state is not None:
+                    if state == "Code Review":
+                        await _reject_if_patch_review_required(db, ticket_id)
                     fields["state"] = state
                 if linked_pr is not None:
                     fields["linked_pr"] = linked_pr
@@ -1039,6 +1132,221 @@ def status_cmd(ctx: click.Context, as_json: bool) -> None:
     _run(_status())
 
 
+@main.group()
+def backends() -> None:
+    """Backend configuration commands."""
+
+
+@backends.command("status")
+@click.pass_context
+def backends_status_cmd(ctx: click.Context) -> None:
+    """Show configured backend status with runtime state."""
+    repo_root = Path.cwd()
+
+    try:
+        items = load_configured_backends(repo_root)
+    except BackendCatalogError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not items:
+        click.echo("No backends configured.")
+        return
+
+    async def _status_rows() -> list[tuple[str, str, str, str, str, str]]:
+        async with Database(Path(ctx.obj["db_path"])) as db:
+            store = BackendStateStore(db)
+            rows: list[tuple[str, str, str, str, str, str]] = []
+            now = datetime.now(UTC).isoformat()
+            for backend in items:
+                active_leases = await store.count_active_leases(backend.id)
+                window_start = fixed_window_start(backend.quota, now)
+                if backend.quota.mode == "fixed-window" and backend.quota.step_limit is not None:
+                    recorded_usage = await store.get_recorded_step_usage(
+                        backend.id,
+                        since=window_start,
+                    )
+                    remaining_steps = str(max(backend.quota.step_limit - recorded_usage, 0))
+                elif backend.quota.mode == "unlimited":
+                    remaining_steps = "unlimited"
+                else:
+                    remaining_steps = "-"
+                if backend.quota.dispatch_limit is not None:
+                    dispatches = await store.count_backend_dispatches(
+                        backend.id,
+                        since=window_start,
+                    )
+                    remaining_dispatches = str(max(backend.quota.dispatch_limit - dispatches, 0))
+                else:
+                    remaining_dispatches = "-"
+
+                cooldown = await store.get_cooldown(backend.id)
+                failure_state = await store.get_failure_state(backend.id)
+                cooldown_until = "-" if cooldown is None else cooldown.cooldown_until
+                failure_count = "0"
+                last_failure_reason = "-"
+                if failure_state is not None:
+                    failure_count = str(failure_state.consecutive_failures)
+                    last_failure_reason = failure_state.last_failure_classification
+                if cooldown is not None:
+                    last_failure_reason = cooldown.reason
+
+                rows.append(
+                    (
+                        str(active_leases),
+                        remaining_steps,
+                        remaining_dispatches,
+                        cooldown_until,
+                        failure_count,
+                        last_failure_reason,
+                    )
+                )
+            return rows
+
+    runtime_rows = _run(_status_rows())
+
+    static_table = Table(show_header=True, header_style="bold", title="Backend Status")
+    static_table.add_column("ID")
+    static_table.add_column("Enabled")
+    static_table.add_column("Logical Agents")
+    static_table.add_column("Priority")
+    static_table.add_column("Concurrency")
+    static_table.add_column("Model")
+    static_table.add_column("Physical Alias")
+    static_table.add_column("Quota")
+    static_table.add_column("Step Reserve")
+
+    runtime_table = Table(show_header=True, header_style="bold", title="Backend Runtime")
+    runtime_table.add_column("ID")
+    runtime_table.add_column("Active Leases")
+    runtime_table.add_column("Remaining Steps")
+    runtime_table.add_column("Remaining Dispatches")
+    runtime_table.add_column("Cooldown Until", overflow="fold")
+    runtime_table.add_column("Failure Count")
+    runtime_table.add_column("Last Failure", overflow="fold")
+    for backend, runtime in zip(items, runtime_rows, strict=True):
+        reserve = "-" if backend.min_reserve is None else str(backend.min_reserve)
+        static_table.add_row(
+            backend.id,
+            "yes" if backend.enabled else "no",
+            ", ".join(backend.logical_agents),
+            str(backend.priority),
+            str(backend.concurrency),
+            backend.model,
+            backend.physical_alias,
+            backend.quota.mode,
+            reserve,
+        )
+        runtime_table.add_row(
+            backend.id,
+            runtime[0],
+            runtime[1],
+            runtime[2],
+            runtime[3],
+            runtime[4],
+            runtime[5],
+        )
+    console.print(static_table)
+    console.print(runtime_table)
+
+
+@backends.command("history")
+@click.argument("ticket_id")
+@click.pass_context
+def backends_history_cmd(ctx: click.Context, ticket_id: str) -> None:
+    """Show backend allocation history for one ticket."""
+
+    async def _load_history() -> BackendHistoryLoadResult:
+        async with Database(Path(ctx.obj["db_path"])) as db:
+            store = BackendStateStore(db)
+            attempts = await store.list_dispatch_attempts(ticket_id)
+            if not attempts:
+                raise BackendHistoryNotFoundError(ticket_id)
+
+            leases_by_backend: dict[str, list[object]] = {}
+            for lease in await store.list_ticket_leases(ticket_id):
+                leases_by_backend.setdefault(lease.backend_id, []).append(lease)
+
+            usage_by_backend: dict[str, list[object]] = {}
+            for usage in await store.list_ticket_step_usage(ticket_id):
+                usage_by_backend.setdefault(usage.backend_id, []).append(usage)
+
+            return attempts, leases_by_backend, usage_by_backend
+
+    attempts, leases_by_backend, usage_by_backend = _run(_load_history())
+    click.echo(f"Backend history for {ticket_id}")
+    fallback_chain = " -> ".join(attempt.selected_backend_id for attempt in attempts)
+    click.echo(f"Fallback chain: {fallback_chain}")
+
+    table = Table(show_header=True, header_style="bold", title="Attempt History")
+    table.add_column("Attempted At", overflow="fold")
+    table.add_column("Backend")
+    table.add_column("Physical Alias", overflow="fold")
+    table.add_column("Outcome")
+    table.add_column("Skipped Reason", overflow="fold")
+    table.add_column("Step Usage")
+    table.add_column("Lease Status")
+
+    for attempt in attempts:
+        lease = None
+        usage = None
+        if attempt.skipped_reason is None:
+            lease_rows = leases_by_backend.get(attempt.selected_backend_id, [])
+            usage_rows = usage_by_backend.get(attempt.selected_backend_id, [])
+            if lease_rows:
+                lease = lease_rows.pop(0)
+            if usage_rows:
+                usage = usage_rows.pop(0)
+
+        if attempt.skipped_reason is not None:
+            outcome = "skipped"
+        elif attempt.failure_classification is not None:
+            outcome = attempt.failure_classification
+        else:
+            outcome = "success"
+
+        if usage is None:
+            step_usage = "-"
+        else:
+            actual_steps = "?" if usage.actual_steps is None else str(usage.actual_steps)
+            step_usage = f"{usage.reserved_steps}/{actual_steps}"
+
+        lease_status = "-" if lease is None else lease.status
+        table.add_row(
+            attempt.attempted_at,
+            attempt.selected_backend_id,
+            attempt.physical_alias,
+            outcome,
+            attempt.skipped_reason or "-",
+            step_usage,
+            lease_status,
+        )
+
+    console.print(table)
+
+
+@backends.command("reset-cooldown")
+@click.argument("backend_id")
+@click.pass_context
+def backends_reset_cooldown_cmd(ctx: click.Context, backend_id: str) -> None:
+    """Clear persisted cooldown state for one configured backend."""
+    repo_root = Path.cwd()
+
+    try:
+        items = load_configured_backends(repo_root)
+    except BackendCatalogError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not any(item.id == backend_id for item in items):
+        raise BackendNotFoundError(backend_id)
+
+    async def _clear() -> None:
+        async with Database(Path(ctx.obj["db_path"])) as db:
+            await BackendStateStore(db).clear_cooldown(backend_id)
+
+    _run(_clear())
+    click.echo(f"Cleared cooldown for backend {backend_id}.")
+
+
 @main.command("decompose")
 @click.argument("prd_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
 @click.option("--issue", "issue_id", type=int, help="Overwrite an existing GitHub issue.")
@@ -1292,7 +1600,7 @@ def _print_events(events: list, *, as_json: bool = False) -> None:
         )
         return
     for e in events:
-        console.print(f"{e.timestamp}  {e.ticket_id}  {e.actor}: {e.old_state} → {e.new_state}")
+        click.echo(f"{e.timestamp}  {e.ticket_id}  {e.actor}: {e.old_state} → {e.new_state}")
 
 
 @main.group()

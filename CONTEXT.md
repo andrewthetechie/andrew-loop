@@ -97,6 +97,10 @@ Deterministic validation performed by the router before dispatching an expensive
 The workflow boundary where a **Reviewer** evaluates a **Ticket** after coding as a separate lifecycle step, not as a subtask inside implementation.
 _Avoid_: inline review, self-review, embedded review
 
+**Patch-review handoff gate**:
+A deterministic check at the **Code Review** transition boundary that requires patch-reviewer delegation output before a nontrivial coder diff can hand off. Skipped only for clearly trivial diffs by deterministic criteria. The verdict is scoped to the current dispatch attempt.
+_Avoid_: pre-review, optional review, prompt-level review
+
 **Internal delegation**:
 The practice of letting an implementation agent spawn helper agents inside a single **Ticket** without exposing those helpers as separate workflow items to the **Router**.
 _Avoid_: child ticket, tracked subtask, router-visible subagent
@@ -116,6 +120,86 @@ _Avoid_: hands-on primary coder, full-context implementer
 **Router-visible coder**:
 The existing router-dispatched implementation role named `coder`. It is retained as the public workflow identity but now behaves as the **Implementation coordinator**.
 _Avoid_: leaf coder, reviewer
+
+**Coder backend**:
+A configured inference capacity target that can run a **Router-visible coder** dispatch, with its own priority, limits, availability, and usage tracking.
+_Avoid_: coder1, coder2, provider, worker
+
+**Logical agent**:
+The workflow role selected by the **Router** from ticket state, independent of which **Coder backend** or concrete harness configuration runs it.
+_Avoid_: physical agent, model alias
+
+**Physical agent alias**:
+A generated agent-harness identity used to satisfy model-binding constraints while preserving the public **Logical agent** in the workflow.
+_Avoid_: router-visible role, ticket state
+
+**Backend lease**:
+A temporary claim on a **Coder backend** for one agent dispatch, used to prevent exceeding concurrency or configured limits.
+_Avoid_: lock, reservation, assignment
+
+**Backend quota**:
+A configured consumption limit for a **Coder backend** over a time window, such as requests per day or tokens per hour.
+_Avoid_: rate limit, provider limit
+
+**Step quota**:
+A **Backend quota** counted from agent step events as the closest router-observable approximation of provider request consumption.
+_Avoid_: dispatch quota, token quota
+
+**Step reserve**:
+A pessimistic hold against a **Step quota** before dispatch, sized to ensure a **Coder backend** has enough remaining capacity for a full agent loop.
+_Avoid_: quota guess, soft limit
+
+**Backend state**:
+The persisted runtime record of **Coder backend** leases, quota usage, cooldowns, failures, and dispatch attempts.
+_Avoid_: provider cache, runtime config
+
+**Backend allocator**:
+The deterministic component that selects an eligible **Coder backend**, creates a **Backend lease**, and reconciles quota, cooldown, and failure state after dispatch.
+_Avoid_: scheduler, provider router, load balancer
+
+**Backend catalog**:
+A static configuration source that describes available **Coder backends**, their physical agent aliases, models, priorities, quotas, and health policy.
+_Avoid_: provider list, model list, load balancer config
+
+**Backend health**:
+A cached failure-driven availability signal for a **Coder backend** that prevents repeated allocation to endpoints that recently failed.
+_Avoid_: live preflight, readiness probe
+
+**Backend observability**:
+The status, history, and allocation-reason reporting needed to explain **Coder backend** selection, quota use, cooldowns, and fallbacks.
+_Avoid_: dashboard, analytics
+
+**Active dispatch view**:
+A router TUI view that shows multiple in-flight dispatches and lets the operator inspect one selected dispatch's stream and backend details.
+_Avoid_: dashboard, single-agent panel
+
+**Graceful router stop**:
+A shutdown mode where the Router stops scheduling new dispatches, waits for active dispatches to finish, then reconciles leases and exits.
+_Avoid_: kill all agents, immediate abort
+
+**Git setup gate**:
+A short-lived serialized section for shared git operations before parallel agent sessions start.
+_Avoid_: global dispatch lock, parallel git setup
+
+**Backend cooldown**:
+A temporary unavailable state for a **Coder backend** after failures, quota exhaustion, or provider-directed retry timing.
+_Avoid_: dead provider, disabled backend
+
+**Parallel coder dispatch**:
+A Router mode that allows multiple dependency-unblocked **Router-visible coder** dispatches to run at the same time on separate **Coder backends**.
+_Avoid_: parallel agents, parallel tickets, concurrent workflow
+
+**Pre-execution backend failure**:
+A backend failure that occurs before an agent could mutate the ticket worktree or workflow state, making deterministic retry on another **Coder backend** safe.
+_Avoid_: safe failure, startup failure
+
+**Post-execution backend failure**:
+A backend failure after an agent may have mutated the ticket worktree or workflow state, requiring preservation or escalation instead of blind retry.
+_Avoid_: unsafe failure, partial failure
+
+**Priority backend allocation**:
+A deterministic backend selection policy that evaluates eligible **Coder backends** in configured priority order and uses stable tie-breaking.
+_Avoid_: weighted load balancing, random routing, provider roulette
 
 **Native subagent delegation**:
 Delegation performed inside a running OpenCode agent through the built-in Task tool and `mode: subagent` agent definitions, rather than by launching a separate external workflow.
@@ -167,11 +251,38 @@ _Avoid_: opaque score, premature routing formula
 - All ticket PRs target the **Feature branch** derived from the ticket's **PRD**
 - The **Router** in **Issue mode** scopes work to one **PRD**'s tickets at a time
 - The **Independent review gate** sits between `Code Review` and `Ready to Merge`
+- The **Patch-review handoff gate** sits at the boundary between coder dispatch and the **Independent review gate**
+- The **Patch-review handoff gate** is per-dispatch-attempt — a verdict from a prior attempt does not satisfy the gate for a new attempt
+- The **Patch-review handoff gate** is universal across **Coder backends** and is not skipped based on backend identity
 - **Internal delegation** happens within one **Ticket** and does not create new **Ticket** states
 - The **Implementation coordinator** may use **Internal delegation** to assign bounded work to one or more **Leaf coders**
 - The **Implementation coordinator** owns final validation and handoff for the parent **Ticket**
 - An **Orchestration-first coordinator** minimizes direct coding to keep parent-ticket context small
 - The **Router-visible coder** is the current public name for the **Implementation coordinator**
+- The **Router** selects a **Logical agent** from ticket state, then may allocate a **Coder backend** for that dispatch
+- A **Coder backend** may require a **Physical agent alias** when the **Agent harness** binds models at agent-config time
+- A **Physical agent alias** is stable per **Coder backend** and must not become a router-visible workflow role
+- A **Backend catalog** defines available **Coder backends**; **Backend state** records runtime usage and availability
+- **Backend health** is derived from recent failures in this milestone; live preflight checks are out of scope
+- **Backend observability** must expose current status, allocation history, skipped-backend reasons, and manual cooldown reset
+- An **Active dispatch view** replaces single-agent TUI assumptions when **Parallel coder dispatch** is enabled
+- A **Graceful router stop** preserves active dispatches and reconciles their **Backend leases** before exit
+- A **Git setup gate** serializes worktree, branch, fetch, and rebase preparation while allowing agent sessions to run in parallel afterward
+- A **Backend lease** belongs to exactly one in-flight dispatch and one **Coder backend**
+- A **Coder backend** may have zero or more **Backend quotas**
+- A **Step quota** is preferred for request-limited **Coder backends** when step events are available
+- A **Step reserve** is created before dispatch and reconciled against actual step usage when the dispatch ends
+- A **Coder backend** below its required **Step reserve** is ineligible for coder dispatch until its quota window restores enough capacity
+- **Backend state** is persisted by the **Deterministic layer** so router restarts do not forget leases, quota usage, or cooldowns
+- The **Backend allocator** owns **Priority backend allocation**, **Backend leases**, **Step reserves**, **Backend cooldowns**, and failure reconciliation
+- A **Backend cooldown** temporarily excludes one **Coder backend** from allocation without changing the **Logical agent**
+- Multiple **Coder backend** entries may serve the same **Logical agent** without creating new router-visible ticket states
+- **Parallel coder dispatch** may run multiple **Router-visible coder** dispatches only when each has a separate **Backend lease**
+- **Parallel coder dispatch** relies on ticket dependencies and per-ticket worktrees for safety; cross-ticket merge conflicts remain a human/dependency-modeling concern
+- Backend allocation is modeled generically for **Logical agents** but is enabled only for **Router-visible coder** dispatches in the first milestone
+- A **Pre-execution backend failure** may be retried on another **Coder backend**
+- A **Post-execution backend failure** must preserve or escalate the current ticket attempt before any reassignment
+- **Priority backend allocation** chooses the first eligible **Coder backend** by priority, configured order, and backend identifier
 - **Native subagent delegation** is the preferred mechanism for **Internal delegation**
 - **Subprocess fallback** is reserved for headless or non-native delegation cases
 - **Single-writer delegation** is the initial safety rule for any write-capable **Leaf coder**
@@ -203,6 +314,9 @@ _Avoid_: opaque score, premature routing formula
 > **Dev:** "When the router dispatches `coder`, is that still the old single worker?"
 > **Domain expert:** "No — the **Router-visible coder** now refers to the **Implementation coordinator**, while `leaf-coder` is the hidden write helper."
 >
+> **Dev:** "Should we create `coder1`, `coder2`, and `coder3` for different inference servers?"
+> **Domain expert:** "No — keep one **Logical agent** named `coder` and schedule it onto different **Coder backends**. Use **Physical agent aliases** only below the workflow boundary when the **Agent harness** requires them."
+>
 > **Dev:** "Can the hidden writer commit and move the ticket after it edits the files?"
 > **Domain expert:** "No — use **Coordinator-owned workflow mutation** so only the **Router-visible coder** performs commits, PR updates, and ticket transitions."
 >
@@ -214,6 +328,9 @@ _Avoid_: opaque score, premature routing formula
 >
 > **Dev:** "What actually triggers helper use?"
 > **Domain expert:** "Use the **Delegation trigger policy**: delegate for multi-file work, overloaded local context, or clean search-versus-edit splits."
+>
+> **Dev:** "If the coder ran on a strong cloud backend, can it skip patch-review?"
+> **Domain expert:** "No — the **Patch-review handoff gate** is universal across **Coder backends**. Trivial-diff criteria are the only way to skip it."
 
 ## Flagged Ambiguities
 

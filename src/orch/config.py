@@ -10,7 +10,9 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+DEFAULT_MAX_REWORK_LOOPS = 3
 
 
 class WebhookConfig(BaseModel):
@@ -32,6 +34,8 @@ class SetupConfig(BaseModel):
 
 class RouterConfig(BaseModel):
     poll_interval: float = 10.0
+    max_parallel_coder_dispatches: int = Field(default=1, ge=1)
+    max_rework_loops: int = Field(default=DEFAULT_MAX_REWORK_LOOPS, ge=1)
 
 
 class HindsightConfig(BaseModel):
@@ -63,11 +67,18 @@ class AgentModelConfig(BaseModel):
     model: str = ""
 
 
+class HiddenHelperConfig(BaseModel):
+    model: str = ""
+    max_concurrent: int = Field(default=1, ge=1)
+
+
 class AgentsConfig(BaseModel):
     coder: AgentModelConfig = AgentModelConfig()
     reviewer: AgentModelConfig = AgentModelConfig()
     merger: AgentModelConfig = AgentModelConfig()
     decomposer: AgentModelConfig = AgentModelConfig()
+    patch_reviewer: HiddenHelperConfig = HiddenHelperConfig()
+    codebase_scout: HiddenHelperConfig = HiddenHelperConfig()
 
 
 class StateConfig(BaseModel):
@@ -76,6 +87,20 @@ class StateConfig(BaseModel):
 
 class GithubConfig(BaseModel):
     prd_labels: list[str] = []
+
+
+class BackendOverrideConfig(BaseModel):
+    enabled: bool | None = None
+    priority: int | None = None
+    concurrency: int | None = Field(default=None, ge=1)
+    min_reserve: int | None = Field(default=None, ge=0)
+
+
+class BackendsConfig(BaseModel):
+    enabled: bool = False
+    catalog_paths: list[str] = []
+    order: list[str] = []
+    overrides: dict[str, BackendOverrideConfig] = {}
 
 
 class Config(BaseModel):
@@ -89,6 +114,7 @@ class Config(BaseModel):
     agents: AgentsConfig = AgentsConfig()
     state: StateConfig = StateConfig()
     github: GithubConfig = GithubConfig()
+    backends: BackendsConfig = BackendsConfig()
 
     @classmethod
     def load(

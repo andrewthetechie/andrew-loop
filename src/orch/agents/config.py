@@ -9,11 +9,15 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from orch.backends import BackendDefinition
+
 AGENTS_SOURCE_DIR = Path(__file__).parent
 
 # .opencode/ lives at the repo root — 4 levels up from src/orch/agents/
 _OPENCODE_SOURCE_DIR = Path(__file__).parent.parent.parent.parent / ".opencode"
 TOOLS_SOURCE_DIR = _OPENCODE_SOURCE_DIR / "tools"
+PLUGIN_SOURCE_DIR = _OPENCODE_SOURCE_DIR / "plugin"
+HIDDEN_HELPER_SEMAPHORE_PLUGIN = "./.opencode/plugin/hidden-helper-semaphore.js"
 
 
 class AgentConfig(BaseModel):
@@ -74,6 +78,12 @@ def merge_opencode_json(
 
     if "agent" not in existing:
         existing["agent"] = {}
+    plugins = existing.get("plugin")
+    if not isinstance(plugins, list):
+        plugins = []
+    if HIDDEN_HELPER_SEMAPHORE_PLUGIN not in plugins:
+        plugins.append(HIDDEN_HELPER_SEMAPHORE_PLUGIN)
+    existing["plugin"] = plugins
 
     diffs: dict[str, dict[str, Any]] = {}
 
@@ -115,12 +125,16 @@ def coder_agent_config() -> AgentConfig:
             "ticket-comment": "allow",
             "ticket-list": "allow",
             "delegation-record": "allow",
-            "serena_*": "allow",
-            "gitnexus_*": "allow",
-            "context7_*": "allow",
-            "pullmd_*": "allow",
-            "hindsight_*": "allow",
-            "firecrawl_*": "allow",
+            "validate": "allow",
+            "pr-create": "allow",
+            "pr-update": "allow",
+            "serena_*": "deny",
+            "gitnexus_*": "deny",
+            "context7_*": "deny",
+            "pullmd_*": "deny",
+            "hindsight_*": "deny",
+            "firecrawl_*": "deny",
+            "skill": "deny",
         },
     )
 
@@ -151,10 +165,28 @@ def reviewer_agent_config() -> AgentConfig:
             "ticket-read": "allow",
             "ticket-update": "allow",
             "ticket-comment": "allow",
-            "serena_*": "allow",
             "gitnexus_*": "allow",
-            "context7_*": "allow",
-            "hindsight_*": "allow",
+            # Serena: read-only
+            "serena_*": "deny",
+            "serena_activate_project": "allow",
+            "serena_find_*": "allow",
+            "serena_get_*": "allow",
+            "serena_search_*": "allow",
+            "serena_read_*": "allow",
+            "serena_list_*": "allow",
+            "serena_check_*": "allow",
+            "serena_onboarding": "allow",
+            "serena_initial_instructions": "allow",
+            # Hindsight: retain and recall only
+            "hindsight_*": "deny",
+            "hindsight_retain": "allow",
+            "hindsight_sync_retain": "allow",
+            "hindsight_recall": "allow",
+            "hindsight_reflect": "allow",
+            # Deny unused servers
+            "context7_*": "deny",
+            "pullmd_*": "deny",
+            "firecrawl_*": "deny",
         },
     )
 
@@ -183,6 +215,13 @@ def merger_agent_config() -> AgentConfig:
             "ticket-comment": "allow",
             "pr-status": "allow",
             "pr-merge": "allow",
+            "serena_*": "deny",
+            "gitnexus_*": "deny",
+            "context7_*": "deny",
+            "pullmd_*": "deny",
+            "hindsight_*": "deny",
+            "firecrawl_*": "deny",
+            "skill": "deny",
         },
     )
 
@@ -206,12 +245,31 @@ def decomposer_agent_config() -> AgentConfig:
             "task": "deny",
             "websearch": "deny",
             "webfetch": "deny",
-            "serena_*": "allow",
+            "ticket-create": "allow",
+            "ticket-list": "allow",
             "gitnexus_*": "allow",
+            # Serena: read-only
+            "serena_*": "deny",
+            "serena_activate_project": "allow",
+            "serena_find_*": "allow",
+            "serena_get_*": "allow",
+            "serena_search_*": "allow",
+            "serena_read_*": "allow",
+            "serena_list_*": "allow",
+            "serena_check_*": "allow",
+            "serena_onboarding": "allow",
+            "serena_initial_instructions": "allow",
+            # Hindsight: recall only (decomposer reads, does not write)
+            "hindsight_*": "deny",
+            "hindsight_recall": "allow",
+            "hindsight_reflect": "allow",
+            "hindsight_list_mental_models": "allow",
+            "hindsight_get_mental_model": "allow",
+            # Context7: keep for library lookups
             "context7_*": "allow",
-            "pullmd_*": "allow",
-            "hindsight_*": "allow",
-            "firecrawl_*": "allow",
+            # Deny unused
+            "pullmd_*": "deny",
+            "firecrawl_*": "deny",
         },
     )
 
@@ -245,9 +303,13 @@ def leaf_coder_agent_config() -> AgentConfig:
             "pr-update": "deny",
             "pr-status": "deny",
             "pr-merge": "deny",
-            "serena_*": "allow",
-            "gitnexus_*": "allow",
-            "context7_*": "allow",
+            "serena_*": "deny",
+            "gitnexus_*": "deny",
+            "context7_*": "deny",
+            "pullmd_*": "deny",
+            "hindsight_*": "deny",
+            "firecrawl_*": "deny",
+            "skill": "deny",
         },
     )
 
@@ -281,9 +343,22 @@ def codebase_scout_agent_config() -> AgentConfig:
             "pr-update": "deny",
             "pr-status": "deny",
             "pr-merge": "deny",
-            "serena_*": "allow",
+            # Serena: read-only
+            "serena_*": "deny",
+            "serena_activate_project": "allow",
+            "serena_find_*": "allow",
+            "serena_get_*": "allow",
+            "serena_search_*": "allow",
+            "serena_read_*": "allow",
+            "serena_list_*": "allow",
+            "serena_check_*": "allow",
+            "serena_onboarding": "allow",
+            "serena_initial_instructions": "allow",
             "gitnexus_*": "allow",
-            "context7_*": "allow",
+            "context7_*": "deny",
+            "pullmd_*": "deny",
+            "hindsight_*": "deny",
+            "firecrawl_*": "deny",
         },
     )
 
@@ -317,8 +392,22 @@ def patch_reviewer_agent_config() -> AgentConfig:
             "pr-update": "deny",
             "pr-status": "deny",
             "pr-merge": "deny",
-            "serena_*": "allow",
+            # Serena: read-only
+            "serena_*": "deny",
+            "serena_activate_project": "allow",
+            "serena_find_*": "allow",
+            "serena_get_*": "allow",
+            "serena_search_*": "allow",
+            "serena_read_*": "allow",
+            "serena_list_*": "allow",
+            "serena_check_*": "allow",
+            "serena_onboarding": "allow",
+            "serena_initial_instructions": "allow",
             "gitnexus_*": "allow",
+            "context7_*": "deny",
+            "pullmd_*": "deny",
+            "hindsight_*": "deny",
+            "firecrawl_*": "deny",
         },
     )
 
@@ -339,23 +428,36 @@ HIDDEN_HELPER_AGENTS: list[AgentConfig] = [
 KNOWN_AGENTS: list[AgentConfig] = [*VISIBLE_AGENTS, *HIDDEN_HELPER_AGENTS]
 
 
+_CODER_INHERITING_HELPERS = frozenset({"leaf-coder"})
+
+
 def compile_all_agents(
     agent_models: dict[str, str],
+    *,
+    configured_backends: list[BackendDefinition] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Compile all known agents with models from orch config.
 
-    Visible agents use their own configured model. Hidden implementation
-    helpers inherit the coder model so they can be installed without becoming
-    router-visible roles in orch config.
+    Visible agents use their own configured model. leaf-coder inherits the
+    coder model (it shares the active coder backend). Other hidden helpers
+    (patch-reviewer, codebase-scout) require independent model configuration
+    and are excluded when not configured.
     """
     result: dict[str, dict[str, Any]] = {}
-    helper_model = agent_models.get("coder")
+    coder_model = agent_models.get("coder")
     for agent in KNOWN_AGENTS:
         model = agent_models.get(agent.name)
-        if model is None and agent.hidden:
-            model = helper_model
+        if model is None and agent.hidden and agent.name in _CODER_INHERITING_HELPERS:
+            model = coder_model
         if model:
             result[agent.name] = compile_agent(agent, model=model)
+    if coder_model:
+        for backend in configured_backends or []:
+            if "coder" not in backend.logical_agents:
+                continue
+            alias_config = coder_agent_config()
+            alias_config.name = backend.physical_alias
+            result[backend.physical_alias] = compile_agent(alias_config, model=backend.model)
     return result
 
 
@@ -373,6 +475,16 @@ def copy_tool_files(target_repo: Path) -> None:
         dst = tools_dir / tool_file.name
         if tool_file.resolve() != dst.resolve():
             shutil.copy2(tool_file, dst)
+
+
+def copy_plugin_files(target_repo: Path) -> None:
+    """Copy OpenCode plugin files to target repo's .opencode/plugin/."""
+    plugin_dir = target_repo / ".opencode" / "plugin"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    for plugin_file in sorted(PLUGIN_SOURCE_DIR.glob("*.js")):
+        dst = plugin_dir / plugin_file.name
+        if plugin_file.resolve() != dst.resolve():
+            shutil.copy2(plugin_file, dst)
 
 
 def setup_opencode_deps(target_repo: Path) -> None:

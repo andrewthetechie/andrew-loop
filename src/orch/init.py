@@ -87,6 +87,7 @@ def _alembic_stamp(db_path: Path, revision: str = "head") -> None:
 _DEFAULT_CONFIG = """\
 [router]
 poll_interval = 10.0
+max_rework_loops = 3
 
 [webhook]
 url = ""
@@ -191,20 +192,34 @@ async def init_project(
             AGENTS_SOURCE_DIR,
             KNOWN_AGENTS,
             compile_all_agents,
+            copy_plugin_files,
             copy_prompt_files,
             copy_tool_files,
             merge_opencode_json,
             setup_opencode_deps,
         )
+        from orch.backends import load_configured_backends
 
         agent_models = {
             name: getattr(cfg.agents, name).model
             for name in ("coder", "reviewer", "merger", "decomposer")
             if getattr(cfg.agents, name).model
         }
+        _HIDDEN_HELPER_CONFIG_KEYS = {
+            "patch_reviewer": "patch-reviewer",
+            "codebase_scout": "codebase-scout",
+        }
+        for config_key, agent_name in _HIDDEN_HELPER_CONFIG_KEYS.items():
+            helper_model = getattr(cfg.agents, config_key).model
+            if helper_model:
+                agent_models[agent_name] = helper_model
 
         if agent_models:
-            compiled = compile_all_agents(agent_models)
+            configured_backends = load_configured_backends(repo_root, config=cfg)
+            compiled = compile_all_agents(
+                agent_models,
+                configured_backends=configured_backends,
+            )
             opencode_path = repo_root / "opencode.json"
             merge_result = merge_opencode_json(opencode_path, compiled)
             opencode_path.write_text(json.dumps(merge_result.config, indent=2) + "\n")
@@ -214,6 +229,7 @@ async def init_project(
                 target_repo=repo_root,
             )
             copy_tool_files(repo_root)
+            copy_plugin_files(repo_root)
             setup_opencode_deps(repo_root)
             result.agents_status = "created"
         else:

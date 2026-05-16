@@ -47,9 +47,14 @@ def build_dispatch_prompt(
         sections.append(_validation_section(config))
     elif agent_type == "reviewer":
         sections.append(_pr_section(ticket))
+        sections.append(_validation_section(config))
     elif agent_type == "merger":
         sections.append(_pr_section(ticket))
         sections.append(_review_section(config))
+
+    truncation_markers = config.get("truncation_markers") or []
+    if truncation_markers:
+        sections.append(_truncation_section(truncation_markers))
 
     # Router-owned Hindsight context
     if isinstance(hindsight_context, dict) and hindsight_context:
@@ -153,6 +158,13 @@ def _validation_section(config: dict[str, Any]) -> str:
             lines.append(f"- `{cmd}`")
     else:
         lines.append("No validation commands configured.")
+    return "\n".join(lines)
+
+
+def _truncation_section(markers: list[str]) -> str:
+    lines = ["## Payload Pruning Notes"]
+    for marker in markers:
+        lines.append(f"- {marker}")
     return "\n".join(lines)
 
 

@@ -395,6 +395,15 @@ async def record_delegation_output(
             created_at=_now_iso(),
         )
         session.add(context)
+        if helper_role == "patch-reviewer":
+            session.add(
+                TicketComment(
+                    ticket_id=ticket_id,
+                    author="patch-reviewer",
+                    body="\n".join(["## PATCH_REVIEW_VERDICT", "", output]),
+                    created_at=_now_iso(),
+                )
+            )
         await session.commit()
         await session.refresh(context)
         return context
@@ -539,15 +548,36 @@ async def get_next_routable(
     states: tuple[str, ...] = ("To Do",),
     issue_id: int | None = None,
 ) -> str | None:
-    """Find the next routable ticket, respecting dependencies and priority.
+    """Find the next routable ticket, respecting dependencies and priority."""
+    routable = await get_routable_batch(
+        db,
+        states=states,
+        issue_id=issue_id,
+        limit=1,
+    )
+    if not routable:
+        return None
+    return routable[0]
+
+
+async def get_routable_batch(
+    db: Database,
+    *,
+    limit: int,
+    states: tuple[str, ...] = ("To Do",),
+    issue_id: int | None = None,
+) -> list[str]:
+    """Return up to ``limit`` routable tickets in deterministic priority order.
 
     A ticket is routable when it's in one of the given states and all its
-    dependencies are 'Done'.
+    dependencies are ``Done``.
     When *issue_id* is set, only tickets with that issue_id are considered.
     Priority: most transitive dependents first (unblocks the most work), FIFO tiebreaker.
     """
+    if limit <= 0:
+        return []
+
     async with db.session() as session:
-        # Get tickets in routable states
         query = select(Ticket).where(Ticket.state.in_(states))
         if issue_id is not None:
             query = query.where(Ticket.issue_id == issue_id)
@@ -555,26 +585,21 @@ async def get_next_routable(
         routable_candidates = list(result.scalars().all())
 
         if not routable_candidates:
-            return None
+            return []
 
-        # Load all dependencies
         dep_result = await session.execute(select(TicketDependency))
         all_deps = dep_result.all()
 
-        # Build dependency map: ticket -> set of deps
         deps_map: dict[str, set[str]] = {}
-        # Build reverse map: ticket -> set of dependents
         dependents_map: dict[str, set[str]] = {}
         for row in all_deps:
             dep = row[0]
             deps_map.setdefault(dep.ticket_id, set()).add(dep.depends_on_ticket_id)
             dependents_map.setdefault(dep.depends_on_ticket_id, set()).add(dep.ticket_id)
 
-        # Get all ticket states for dependency checks
         all_tickets_result = await session.execute(select(Ticket.id, Ticket.state))
         state_map = {row[0]: row[1] for row in all_tickets_result.all()}
 
-        # Filter to routable tickets (all deps Done)
         routable: list[Ticket] = []
         for ticket in routable_candidates:
             ticket_deps = deps_map.get(ticket.id, set())
@@ -582,9 +607,8 @@ async def get_next_routable(
                 routable.append(ticket)
 
         if not routable:
-            return None
+            return []
 
-        # Score by transitive dependents count (most dependents first)
         def _transitive_dependents_count(ticket_id: str) -> int:
             visited: set[str] = set()
             stack = [ticket_id]
@@ -596,10 +620,8 @@ async def get_next_routable(
                         stack.append(dep)
             return len(visited)
 
-        # Sort: most transitive dependents first, FIFO tiebreaker (already ordered by created_at)
         routable.sort(key=lambda t: _transitive_dependents_count(t.id), reverse=True)
-
-        return routable[0].id
+        return [ticket.id for ticket in routable[:limit]]
 
 
 async def get_routable_issue_ids(

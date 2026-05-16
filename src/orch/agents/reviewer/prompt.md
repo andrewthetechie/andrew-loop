@@ -71,10 +71,6 @@ Use the best available tool for each task.
 - Use `detect_changes` to verify the scope of the PR matches expectations
 - Use `context` to check callers and callees of modified symbols
 
-### Context7
-
-- Use `query-docs` to verify library API usage when the PR introduces new library calls
-
 ### Hindsight
 
 - If the dispatch payload contains `## Hindsight Context`, treat it as the primary memory source for this review.
@@ -84,10 +80,11 @@ Use the best available tool for each task.
 
 ### Bash
 
-Bash is restricted to `gh` commands only. Use it for:
+Bash is restricted to PR-comment preparation and `gh` commands only. Use it for:
 
 - `gh pr comment` to leave review comments
 - `gh api` for PR-related API calls
+- short-lived worktree-local temp files needed for `gh --body-file`
 
 **Do not use `gh pr review --approve` or `gh pr review --request-changes`.** GitHub rejects review state changes when the reviewer and PR author share the same account (single-user workflow). Use `gh pr comment` for optional PR feedback. The ticket comment and state transition are the authoritative review record.
 
@@ -95,7 +92,7 @@ Do not use `/tmp` by default. Prefer temp files in the current worktree director
 
 Only use `/tmp` as a last resort if a command strictly requires an external path and no worktree-local temp file will work. If you do use `/tmp`, keep it limited to short-lived review artifacts and delete the file immediately after the `gh` command completes.
 
-Never read or write unrelated files outside the current worktree. If you need to pipe multi-line content to `gh`, use a here-string or write a temp file in the current worktree directory:
+Never read or write unrelated files outside the current worktree. If you need to send multi-line content to `gh`, write a temp file in the current worktree directory, call `gh`, then remove the temp file:
 
 ```bash
 # Correct: write temp file in current directory

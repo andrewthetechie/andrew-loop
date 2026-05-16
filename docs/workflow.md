@@ -55,6 +55,7 @@ Create `~/.config/orchestra/config.toml` to set defaults that apply to all repos
 ```toml
 [router]
 poll_interval = 10.0
+max_rework_loops = 3
 
 [webhook]
 url = "https://your-webhook-endpoint.example.com/notify"
@@ -179,6 +180,7 @@ After `orch init`, edit `.orchestra/config.toml` for repo-specific settings:
 ```toml
 [router]
 poll_interval = 10.0        # seconds between ticket polls
+max_rework_loops = 3        # automated Rework dispatches before Needs Human Review
 
 [webhook]
 url = "https://hooks.example.com/my-project"
@@ -194,6 +196,96 @@ url = "http://localhost:8888"
 bank_id = "abc123"           # set by orch init; do not change
 api_key = "your-api-key"
 ```
+
+### Configure Backend Catalogs
+
+When you want deterministic **Coder backend** selection, keep `coder` as the logical
+workflow role and configure backend catalogs instead of creating new router-visible
+agents. This follows
+[ADR-0002](./adr/0002-logical-agents-with-priority-allocated-coder-backends.md):
+the Router still dispatches logical `coder`, while the Agent harness binds the run to
+a stable physical alias such as `coder__cloud_free`.
+
+Example catalog file:
+
+```toml
+[[backends]]
+id = "cloud-free"
+logical_agents = ["coder"]
+physical_alias = "coder__cloud_free"
+model = "gpt-5-mini"
+priority = 10
+concurrency = 1
+min_reserve = 8
+
+[backends.quota]
+mode = "fixed-window"
+step_limit = 120
+dispatch_limit = 10
+window_seconds = 86400
+
+[[backends]]
+id = "burst-free"
+logical_agents = ["coder"]
+physical_alias = "coder__burst_free"
+model = "gpt-4o-mini"
+priority = 20
+concurrency = 1
+
+[backends.quota]
+mode = "dynamic-429"
+
+[[backends]]
+id = "local-fast"
+logical_agents = ["coder"]
+physical_alias = "coder__local_fast"
+model = "qwen3-coder"
+priority = 30
+concurrency = 2
+
+[backends.quota]
+mode = "unlimited"
+```
+
+Repo-level enablement, ordering, and overrides live in `.orchestra/config.toml`:
+
+```toml
+[router]
+poll_interval = 10.0
+max_parallel_coder_dispatches = 2
+max_rework_loops = 3
+
+[backends]
+enabled = true
+catalog_paths = ["backend-catalog.toml"]
+order = ["cloud-free", "burst-free", "local-fast"]
+
+[backends.overrides.cloud-free]
+enabled = true
+priority = 5
+
+[backends.overrides.local-fast]
+concurrency = 3
+min_reserve = 12
+```
+
+Allocation rules:
+
+- Lower numeric `priority` wins first.
+- If priorities match, the repo `order` list breaks ties for listed backends.
+- Remaining equal-priority ties fall back to backend id ordering, so selection stays deterministic.
+- The Router only allocates backends that support the requested logical agent and still have free concurrency.
+
+Quota and reserve behavior:
+
+- `unlimited` backends do not consume tracked Step quota and do not need a persisted Step reserve.
+- `fixed-window` backends must have enough remaining recorded Steps to cover the required Step reserve before dispatch starts.
+- `fixed-window` backends can also set `dispatch_limit` for a coarse per-window dispatch cap.
+- `dynamic-429` backends are not blocked by a fixed Step limit, but they still persist Step reserve and actual Step usage for observability.
+- The Step reserve is `min_reserve` when configured; otherwise it defaults to the coder Step budget for that dispatch.
+- If a request-limited backend falls below the required reserve, the allocator skips it and records `step quota below reserve` in dispatch history.
+- `window_seconds` controls fixed-window resets, such as `60` for per-minute limits or `86400` for daily limits.
+- Cooldowns are persisted in SQLite. Rate-limited and offline backends are skipped until their cooldown expires or an operator clears it.
 
 ---
 
@@ -377,6 +469,61 @@ The router polls every 10 seconds (configurable), picks the highest-priority `To
 orch router start --interval 30    # poll every 30 seconds
 ```
 
+### Backend-Allocated Coder Dispatch
+
+When backend catalogs are enabled, `orch router start` still works in terms of the
+logical `coder` role. The difference is that each coder dispatch is allocated onto a
+configured physical backend alias at run time.
+
+- Allocation is strict priority-first and deterministic.
+- Each active coder dispatch owns its own Backend lease.
+- `router.max_parallel_coder_dispatches` defaults to `1`, so existing serial behavior remains unchanged until you opt in.
+- When parallelism is greater than `1`, the Router can launch multiple dependency-unblocked coder tickets at once if backend capacity allows it.
+- Reviewer and merger dispatch remain outside backend allocation in this milestone.
+
+Parallel safety boundaries in v1:
+
+- Only dependency-unblocked tickets are considered for concurrent coder dispatch.
+- Each ticket still gets its own branch and worktree under `.orchestra/worktrees/`.
+- Shared git setup is serialized through the Router's git setup gate before agents run.
+- Agent sessions overlap only after each ticket's worktree and branch preparation succeeds.
+- If worktree setup gates a ticket, that ticket is moved through the existing safety path without cancelling unrelated active coder dispatches.
+- Conflict-aware batching is intentionally out of scope for v1. Dependencies plus downstream review and merge gates handle cross-ticket conflicts.
+
+### Backend Observability
+
+Static and runtime backend state is operator-visible:
+
+```sh
+orch backends status
+orch backends history ORCH-001
+orch backends reset-cooldown cloud-free
+```
+
+`orch backends status` shows two tables:
+
+- `Backend Status` lists configured metadata such as id, logical agents, priority, concurrency, model, physical alias, quota mode, and Step reserve.
+- `Backend Runtime` lists active leases, remaining recorded Steps, cooldown deadline, consecutive failure count, and the last failure reason.
+
+`orch backends history <ticket-id>` shows one ticket's allocation attempts in order:
+
+- `Fallback chain` shows the exact backend-selection sequence.
+- `Attempt History` shows backend id, physical alias, outcome, skipped reason, Step usage as `reserved/actual`, and lease status.
+- Skipped attempts stay visible, which makes priority and cooldown decisions debuggable.
+
+`orch backends reset-cooldown <backend-id>` removes persisted cooldown state for a configured backend so it becomes eligible immediately on the next allocation pass.
+
+### TUI Active Dispatch View
+
+`orch router start` uses the TUI by default unless you pass `--no-tui`. With parallel
+coder dispatch enabled, the TUI becomes the main operator view for active backend work.
+
+- `Router Info` shows an `Active Dispatches` table with ticket, logical agent, backend id, worker alias or model, Step usage, runtime, last tool, and status.
+- The lower-left `Event Log` remains global across all dispatches.
+- The lower-right `Agent Stream` shows only the currently selected dispatch, so output from multiple coders does not mix.
+- `Tab` cycles to the next active dispatch and `Shift-Tab` cycles backward.
+- When the selected dispatch finishes, the stream follows another active dispatch if one exists; otherwise the panel returns to an empty state.
+
 ### Monitor with `orch status`
 
 In a second terminal:
@@ -430,7 +577,7 @@ Rework path (reviewer sends back):
 Code Review → Rework → In Progress → Code Review → ...
 ```
 
-After 3 rework loops the router automatically escalates:
+After the configured rework loop limit (default 3) the router automatically escalates:
 
 ```
 Rework → Needs Human Review
@@ -484,7 +631,7 @@ Agent stdout/stderr is written to `.orchestra/logs/<ticket-id>.log`.
 A ticket reaches `Needs Human Review` when:
 
 - The coder agent exited without completing (non-zero exit or no state transition)
-- The rework loop count reached 3 without passing review
+- The rework loop count reached the configured limit without passing review
 - The reviewer agent explicitly escalated
 
 **Steps:**
@@ -634,7 +781,7 @@ Verify `webhook.url` is set in `.orchestra/config.toml` (not just the global con
 
 ### Rework loops not stopping
 
-The router escalates after 3 rework loops. If the reviewer keeps sending back due to a persistent code quality issue, inspect the reviewer log, edit the ticket's acceptance criteria to be more precise, reset `rework_loop_count` manually via direct DB edit, and move back to `To Do`.
+The router escalates after `router.max_rework_loops` rework loops. If the reviewer keeps sending back due to a persistent code quality issue, inspect the reviewer log, edit the ticket's acceptance criteria to be more precise, reset `rework_loop_count` manually via direct DB edit, and move back to `To Do`.
 
 ---
 
